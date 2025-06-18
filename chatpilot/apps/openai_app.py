@@ -52,6 +52,19 @@ from metagpt.roles.di.data_interpreter import DataInterpreter
 # from examples.di.machine_learning_with_tools import main_generator
 from shared_queue import cleanup_queue, queue_empty, get_message
 
+# Import metagpt config classes at runtime to avoid path issues
+import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__), '../../agent'))
+
+try:
+    from metagpt.config2 import Config
+    from metagpt.configs.llm_config import LLMConfig
+    METAGPT_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"Failed to import metagpt config classes: {e}")
+    METAGPT_AVAILABLE = False
+
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -83,12 +96,136 @@ app.state.MODELS = {}
 # Agent for Assistant
 app.state.AGENT = None
 app.state.MODEL_NAME = None
-# Key: user_id, Value: { "interpreter": DataInterpreter, "last_active": timestamp }
+# Key: user_id, Value: { "interpreter": DataInterpreter, "last_active": timestamp, "session_id": str, "session_files": list }
 app.state.USER_CONVERSATIONS: Dict[str, Dict] = {}
 app.state.conversation_lock = asyncio.Lock()
 
 # User request tracking
 user_request_tracker = defaultdict(lambda: {"daily": [], "minute": []})
+
+
+def generate_session_id() -> str:
+    """
+    Generate a unique session ID for conversation sessions.
+    
+    Returns:
+        str: A unique session identifier
+    """
+    timestamp = str(int(time.time()))
+    random_part = str(uuid.uuid4()).split('-')[0]
+    return f"{timestamp}_{random_part}"
+
+
+def get_session_file_path(user_id: str, session_id: str, filename: str) -> str:
+    """
+    Generate the file path for a session-specific file.
+    
+    Args:
+        user_id: The user ID
+        session_id: The session ID
+        filename: The filename
+        
+    Returns:
+        str: The complete file path for the session file
+    """
+    return f"{UPLOAD_DIR}/{user_id}/session_{session_id}/{filename}"
+
+
+def cleanup_expired_sessions(max_age_hours: int = 24):
+    """
+    Clean up expired sessions and their associated files.
+    
+    Args:
+        max_age_hours: Maximum age in hours before a session is considered expired
+    """
+    current_time = time.time()
+    expired_sessions = []
+    
+    for user_id, conversation in app.state.USER_CONVERSATIONS.items():
+        last_active = conversation.get("last_active", 0)
+        age_hours = (current_time - last_active) / 3600
+        
+        if age_hours > max_age_hours:
+            expired_sessions.append(user_id)
+            
+            # Clean up session files
+            session_id = conversation.get("session_id")
+            if session_id:
+                import shutil
+                session_dir = f"{UPLOAD_DIR}/{user_id}/session_{session_id}"
+                try:
+                    if os.path.exists(session_dir):
+                        shutil.rmtree(session_dir)
+                        logger.info(f"Cleaned up session directory: {session_dir}")
+                except Exception as e:
+                    logger.error(f"Failed to clean up session directory {session_dir}: {e}")
+    
+    # Remove expired sessions from memory
+    for user_id in expired_sessions:
+        del app.state.USER_CONVERSATIONS[user_id]
+        logger.info(f"Removed expired session for user: {user_id}")
+    
+    return len(expired_sessions)
+
+
+def create_custom_config_for_model(model_name: str):
+    """
+    Create a custom Config with the specified model while preserving other settings from config2.yaml.
+    
+    Args:
+        model_name: The model name selected from frontend
+        
+    Returns:
+        Config: Custom configuration with the specified model, or None if metagpt is not available
+    """
+    if not METAGPT_AVAILABLE:
+        logger.warning("MetaGPT config classes not available, cannot create custom config")
+        return None
+        
+    try:
+        # Load base configuration from config2.yaml
+        base_config = Config.default()
+        
+        # Create custom LLM config with the selected model
+        custom_llm_config = {
+            "api_type": base_config.llm.api_type,
+            "base_url": base_config.llm.base_url,
+            "api_key": base_config.llm.api_key,
+            "model": model_name,  # Override with frontend selected model
+        }
+        
+        # Add proxy if configured
+        if hasattr(base_config.llm, 'proxy') and base_config.llm.proxy:
+            custom_llm_config["proxy"] = base_config.llm.proxy
+            
+        # Add temperature if configured
+        if hasattr(base_config.llm, 'temperature') and base_config.llm.temperature is not None:
+            custom_llm_config["temperature"] = base_config.llm.temperature
+            
+        # Add max_tokens if configured
+        if hasattr(base_config.llm, 'max_tokens') and base_config.llm.max_tokens is not None:
+            custom_llm_config["max_tokens"] = base_config.llm.max_tokens
+        
+        # Create new config with custom LLM configuration
+        custom_config = Config.from_llm_config(custom_llm_config)
+        
+        # Preserve other configurations from base config
+        custom_config.workspace = base_config.workspace
+        custom_config.search = base_config.search
+        custom_config.browser = base_config.browser
+        custom_config.mermaid = base_config.mermaid
+        custom_config.embedding = base_config.embedding
+        custom_config.proxy = base_config.proxy
+        
+        logger.info(f"Created custom config for model: {model_name}, api_type: {custom_config.llm.api_type}, base_url: {custom_config.llm.base_url}")
+        return custom_config
+        
+    except Exception as e:
+        logger.error(f"Failed to create custom config for model {model_name}: {e}")
+        # Fallback to default config
+        if METAGPT_AVAILABLE:
+            return Config.default()
+        return None
 
 
 async def request_rate_limiter(
@@ -480,9 +617,9 @@ async def proxy(
     temperature = body_dict.get("temperature", 0.7)
     num_ctx = body_dict.get('num_ctx', 1024)
     messages = body_dict.get("messages", [])
-    logger.debug(
-        f"model_name: {model_name}, max_tokens: {max_tokens}, "
-        f"num_ctx: {num_ctx}, messages size: {len(messages)}"
+    logger.info(
+        f"Using model: {model_name}, max_tokens: {max_tokens}, "
+        f"num_ctx: {num_ctx}, messages size: {len(messages)}, user: {user.email}"
     )
 
     # deduct and update user quota
@@ -505,13 +642,16 @@ async def proxy(
         new_message = ""
 
     print(app.state.user_files)
-    # get user information from database
-    db_user = Users.get_user_by_id(user.id)
-    if db_user and db_user.uploaded_files:  # check if the user exists and has uploaded files
-        filename = db_user.uploaded_files[0]  # get the latest uploaded file name
-        file_path = f"{UPLOAD_DIR}/{user.id}/{filename}"  # build the complete file path
+    # Session-based file handling - check if current session has uploaded files
+    conversation = app.state.USER_CONVERSATIONS.get(user.id)
+    if conversation and conversation.get("session_files"):
+        # Use the latest file from current session
+        filename = conversation["session_files"][-1]
+        session_id = conversation.get("session_id", "default")
+        file_path = get_session_file_path(user.id, session_id, filename)
         suffix_prompt = f"\nIf the user's requirements involve or mention that it contains a dataset or file, this is the path address: {file_path}."
         new_message = f"{new_message} {suffix_prompt}"
+        logger.info(f"Using session file: {filename} from session {session_id} for user {user.id}")
 
     # combine the user information before the latest user into a new list
     if len(messages) > 2:
@@ -537,25 +677,72 @@ async def proxy(
             conversation = app.state.USER_CONVERSATIONS.get(user.id)
             print(f"existing conversation: {conversation}")
             if conversation:
-                interpreter: DataInterpreter = conversation["interpreter"]
-                logger.warning(f"continue using existing conversation, user_id: {user.id}")
+                # Check if the model has changed
+                stored_interpreter = conversation["interpreter"]
+                stored_model = getattr(stored_interpreter.config.llm, 'model', None) if hasattr(stored_interpreter, 'config') else None
+                
+                if stored_model == model_name:
+                    # Same model, reuse existing interpreter
+                    interpreter: DataInterpreter = stored_interpreter
+                    logger.warning(f"continue using existing conversation with same model, user_id: {user.id}")
+                else:
+                    # Model changed, create new interpreter with new config
+                    logger.warning(f"model changed from {stored_model} to {model_name}, creating new interpreter")
+                    custom_config = create_custom_config_for_model(model_name)
+                    if custom_config:
+                        interpreter = DataInterpreter(use_reflection=True, tools=["<all>"], config=custom_config)
+                        logger.info(f"Created DataInterpreter with model: {interpreter.config.llm.model}")
+                    else:
+                        # Fallback to default DataInterpreter if custom config creation failed
+                        interpreter = DataInterpreter(use_reflection=True, tools=["<all>"])
+                        logger.warning(f"Created DataInterpreter with default config due to config creation failure")
+                    # Preserve session info when model changes
+                    app.state.USER_CONVERSATIONS[user.id] = {
+                        "interpreter": interpreter,
+                        "last_active": time.time(),
+                        "session_id": conversation.get("session_id", generate_session_id()),
+                        "session_files": conversation.get("session_files", [])
+                    }
+                    logger.warning(f"created new conversation with model {model_name}, user_id: {user.id}")
             else:
-                # if there is no existing conversation, create a new one
-                interpreter = DataInterpreter(use_reflection=True, tools=["<all>"])
+                # if there is no existing conversation, create a new one with custom config
+                custom_config = create_custom_config_for_model(model_name)
+                if custom_config:
+                    interpreter = DataInterpreter(use_reflection=True, tools=["<all>"], config=custom_config)
+                    logger.info(f"Created DataInterpreter with model: {interpreter.config.llm.model}")
+                else:
+                    # Fallback to default DataInterpreter if custom config creation failed
+                    interpreter = DataInterpreter(use_reflection=True, tools=["<all>"])
+                    logger.warning(f"Created DataInterpreter with default config due to config creation failure")
+                # Create new conversation for related messages
+                session_id = generate_session_id()
                 app.state.USER_CONVERSATIONS[user.id] = {
                     "interpreter": interpreter,
-                    "last_active": time.time()
+                    "last_active": time.time(),
+                    "session_id": session_id,
+                    "session_files": []
                 }
-                logger.warning(f"start a new conversation, user_id: {user.id}")
+                logger.warning(f"start a new conversation with model {model_name}, user_id: {user.id}")
         else:
-            # create a new conversation
+            # create a new conversation with custom config
             # todo check if we need to terminate the previous Jupyter kernel
-            interpreter = DataInterpreter(use_reflection=True, tools=["<all>"])
+            custom_config = create_custom_config_for_model(model_name)
+            if custom_config:
+                interpreter = DataInterpreter(use_reflection=True, tools=["<all>"], config=custom_config)
+                logger.info(f"Created DataInterpreter with model: {interpreter.config.llm.model}")
+            else:
+                # Fallback to default DataInterpreter if custom config creation failed
+                interpreter = DataInterpreter(use_reflection=True, tools=["<all>"])
+                logger.warning(f"Created DataInterpreter with default config due to config creation failure")
+            # Create new conversation for unrelated messages
+            session_id = generate_session_id()
             app.state.USER_CONVERSATIONS[user.id] = {
                 "interpreter": interpreter,
-                "last_active": time.time()
+                "last_active": time.time(),
+                "session_id": session_id,
+                "session_files": []
             }
-            logger.warning(f"start a new conversation, user_id: {user.id}")
+            logger.warning(f"start a new conversation with model {model_name}, user_id: {user.id}")
 
         # update the last active time of the conversation
         if user.id in app.state.USER_CONVERSATIONS:
@@ -601,7 +788,166 @@ async def proxy(
             cleanup_queue(user.id)
     return StreamingResponse(event_generator(), media_type='text/event-stream')
 
-    # except Exception as e:
-    #     logger.error(e)
-    #     error_detail = "Server Connection Error"
-    #     raise HTTPException(status_code=500, detail=error_detail)
+
+@app.get("/interpreter/model/{user_id}")
+async def get_interpreter_model(user_id: str, user=Depends(get_current_user)):
+    """
+    Get the current model being used by the DataInterpreter for a specific user.
+    """
+    if user.id != user_id and user.role != "admin":
+        raise HTTPException(status_code=403, detail="Access denied")
+        
+    conversation = app.state.USER_CONVERSATIONS.get(user_id)
+    if conversation and "interpreter" in conversation:
+        interpreter = conversation["interpreter"]
+        try:
+            model_name = interpreter.config.llm.model if hasattr(interpreter, 'config') else "unknown"
+            return {
+                "user_id": user_id,
+                "current_model": model_name,
+                "last_active": conversation.get("last_active", 0)
+            }
+        except Exception as e:
+            logger.error(f"Error getting interpreter model for user {user_id}: {e}")
+            return {
+                "user_id": user_id,
+                "current_model": "error",
+                "error": str(e)
+            }
+    else:
+        return {
+            "user_id": user_id,
+            "current_model": None,
+            "message": "No active conversation"
+        }
+
+
+@app.get("/session/files/{user_id}")
+async def get_session_files(user_id: str, user=Depends(get_current_user)):
+    """
+    Get the list of files uploaded in the current session for a specific user.
+    """
+    if user.id != user_id and user.role != "admin":
+        raise HTTPException(status_code=403, detail="Access denied")
+        
+    conversation = app.state.USER_CONVERSATIONS.get(user_id)
+    if conversation:
+        session_files = conversation.get("session_files", [])
+        session_id = conversation.get("session_id", "unknown")
+        return {
+            "user_id": user_id,
+            "session_id": session_id,
+            "files": session_files,
+            "file_count": len(session_files)
+        }
+    else:
+        return {
+            "user_id": user_id,
+            "session_id": None,
+            "files": [],
+            "file_count": 0,
+            "message": "No active session"
+        }
+
+
+@app.delete("/session/files/{user_id}/{filename}")
+async def delete_session_file(user_id: str, filename: str, user=Depends(get_current_user)):
+    """
+    Delete a specific file from the current session.
+    """
+    if user.id != user_id and user.role != "admin":
+        raise HTTPException(status_code=403, detail="Access denied")
+        
+    conversation = app.state.USER_CONVERSATIONS.get(user_id)
+    if not conversation:
+        raise HTTPException(status_code=404, detail="No active session found")
+        
+    session_files = conversation.get("session_files", [])
+    if filename not in session_files:
+        raise HTTPException(status_code=404, detail="File not found in current session")
+        
+    session_id = conversation.get("session_id")
+    if session_id:
+        file_path = get_session_file_path(user_id, session_id, filename)
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+                logger.info(f"Deleted session file: {file_path}")
+            
+            # Remove from session files list
+            session_files.remove(filename)
+            conversation["session_files"] = session_files
+            
+            return {
+                "status": True,
+                "message": f"File {filename} deleted from session {session_id}",
+                "remaining_files": session_files
+            }
+        except Exception as e:
+            logger.error(f"Failed to delete session file {file_path}: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to delete file: {str(e)}")
+    else:
+        raise HTTPException(status_code=500, detail="Session ID not found")
+
+
+@app.post("/session/cleanup")
+async def cleanup_sessions(max_age_hours: int = 24, user=Depends(get_current_user)):
+    """
+    Clean up expired sessions. Admin only endpoint.
+    """
+    if user.role != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+        
+    try:
+        cleaned_count = cleanup_expired_sessions(max_age_hours)
+        return {
+            "status": True,
+            "message": f"Cleaned up {cleaned_count} expired sessions",
+            "cleaned_sessions": cleaned_count
+        }
+    except Exception as e:
+        logger.error(f"Failed to cleanup sessions: {e}")
+        raise HTTPException(status_code=500, detail=f"Cleanup failed: {str(e)}")
+
+
+@app.get("/session/info/{user_id}")
+async def get_session_info(user_id: str, user=Depends(get_current_user)):
+    """
+    Get detailed information about the current session.
+    """
+    if user.id != user_id and user.role != "admin":
+        raise HTTPException(status_code=403, detail="Access denied")
+        
+    conversation = app.state.USER_CONVERSATIONS.get(user_id)
+    if conversation:
+        session_id = conversation.get("session_id", "unknown")
+        session_files = conversation.get("session_files", [])
+        last_active = conversation.get("last_active", 0)
+        has_interpreter = conversation.get("interpreter") is not None
+        
+        # Calculate session age
+        current_time = time.time()
+        age_hours = (current_time - last_active) / 3600 if last_active > 0 else 0
+        
+        return {
+            "user_id": user_id,
+            "session_id": session_id,
+            "files": session_files,
+            "file_count": len(session_files),
+            "last_active": last_active,
+            "age_hours": round(age_hours, 2),
+            "has_interpreter": has_interpreter,
+            "is_active": age_hours < 24
+        }
+    else:
+        return {
+            "user_id": user_id,
+            "session_id": None,
+            "files": [],
+            "file_count": 0,
+            "last_active": 0,
+            "age_hours": 0,
+            "has_interpreter": False,
+            "is_active": False,
+            "message": "No active session"
+        }

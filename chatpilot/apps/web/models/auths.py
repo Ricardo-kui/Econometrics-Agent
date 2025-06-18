@@ -1,5 +1,6 @@
 import uuid
 from typing import Optional
+from datetime import datetime, timedelta
 
 import peewee as pw
 from loguru import logger
@@ -20,6 +21,10 @@ class Auth(pw.Model):
     email = pw.CharField()
     password = pw.CharField()
     active = pw.BooleanField()
+    # Email verification fields (optional: could be managed in User table only)
+    email_verified = pw.BooleanField(default=False)
+    verification_token = pw.CharField(null=True)
+    verification_expires = pw.DateTimeField(null=True)
 
     class Meta:
         database = DB
@@ -30,6 +35,10 @@ class AuthModel(BaseModel):
     email: str
     password: str
     active: bool = True
+    # Email verification fields
+    email_verified: bool = False
+    verification_token: Optional[str] = None
+    verification_expires: Optional[int] = None  # timestamp in epoch
 
 
 ####################
@@ -79,6 +88,12 @@ class SignupForm(BaseModel):
     password: str
 
 
+class SignupResponse(BaseModel):
+    message: str
+    email: str
+    requires_verification: bool = True
+
+
 class AuthsTable:
     def __init__(self, db):
         self.db = db
@@ -90,7 +105,15 @@ class AuthsTable:
         logger.debug(f"insert_new_auth, role: {role}, email: {email}, name: {name}")
         id = str(uuid.uuid4())
         auth = AuthModel(
-            **{"id": id, "email": email, "password": password, "active": True}
+            **{
+                "id": id, 
+                "email": email, 
+                "password": password, 
+                "active": True,
+                "email_verified": False,
+                "verification_token": None,
+                "verification_expires": None,
+            }
         )
         result = Auth.create(**auth.model_dump())
 
@@ -148,6 +171,40 @@ class AuthsTable:
             else:
                 return False
         except:
+            return False
+
+    def set_auth_verification_token(self, id: str, token: str, expires_hours: int = 24) -> bool:
+        """Set email verification token for auth record"""
+        try:
+            expires_time = datetime.now() + timedelta(hours=expires_hours)
+            query = Auth.update(
+                verification_token=token,
+                verification_expires=expires_time
+            ).where(Auth.id == id)
+            result = query.execute()
+            return True if result == 1 else False
+        except Exception as e:
+            logger.error(f"Error setting auth verification token: {e}")
+            return False
+
+    def verify_auth_email(self, token: str) -> bool:
+        """Verify auth email using verification token"""
+        try:
+            auth = Auth.get(
+                Auth.verification_token == token,
+                Auth.verification_expires > datetime.now()
+            )
+            if auth:
+                # Update auth as verified and clear verification fields
+                query = Auth.update(
+                    email_verified=True,
+                    verification_token=None,
+                    verification_expires=None
+                ).where(Auth.id == auth.id)
+                query.execute()
+                return True
+        except Exception as e:
+            logger.error(f"Error verifying auth email: {e}")
             return False
 
 

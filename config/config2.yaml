@@ -1,5 +1,5 @@
 llm:
   api_type: "openai"  # or azure / ollama / groq etc.
-  model: "gpt-4o"  # or gpt-3.5-turbo
-  base_url: "https://api.openai.com/v1"  # or forward url / other llm url
-  api_key: "sk-xxxxx"
+  model: "openai/gpt-4.1"  # or gpt-3.5-turbo
+  base_url: "https://openrouter.ai/api/v1"  # or forward url / other llm url
+  api_key: "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"

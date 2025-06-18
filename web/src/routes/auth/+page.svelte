@@ -1,6 +1,6 @@
 <script>
 	import { goto } from '$app/navigation';
-	import { userSignIn, userSignUp } from '$lib/apis/auths';
+	import { userSignIn, userSignUp, resendVerificationEmail } from '$lib/apis/auths';
 	import { WEBUI_API_BASE_URL, WEBUI_BASE_URL } from '$lib/constants';
 	import { WEBUI_NAME, config, user } from '$lib/stores';
 	import { onMount } from 'svelte';
@@ -8,6 +8,8 @@
 
 	let loaded = false;
 	let mode = 'signin';
+	let awaitingVerification = false;
+	let registeredEmail = '';
 
 	let name = '';
 	let email = '';
@@ -33,12 +35,23 @@
 	};
 
 	const signUpHandler = async () => {
-		const sessionUser = await userSignUp(name, email, password).catch((error) => {
+		const response = await userSignUp(name, email, password).catch((error) => {
 			toast.error(error);
 			return null;
 		});
 
-		await setSessionUser(sessionUser);
+		if (response) {
+			// Check if the response requires email verification
+			if (response.requires_verification) {
+				awaitingVerification = true;
+				registeredEmail = response.email;
+				toast.success(response.message || 'Registration successful! Please check your email to verify your account.');
+				// Don't set user session, wait for email verification
+			} else {
+				// Old format - user can login directly (backward compatibility)
+				await setSessionUser(response);
+			}
+		}
 	};
 
 	const submitHandler = async () => {
@@ -46,6 +59,15 @@
 			await signInHandler();
 		} else {
 			await signUpHandler();
+		}
+	};
+
+	const resendEmailHandler = async () => {
+		try {
+			const response = await resendVerificationEmail(registeredEmail);
+			toast.success(response.message || 'Verification email has been sent.');
+		} catch (error) {
+			toast.error(error || 'Failed to resend verification email');
 		}
 	};
 
@@ -76,12 +98,62 @@
 
 		<div class="w-full sm:max-w-lg px-4 min-h-screen flex flex-col">
 			<div class=" my-auto pb-10 w-full">
-				<form
-					class=" flex flex-col justify-center bg-white py-6 sm:py-16 px-6 sm:px-16 rounded-2xl"
-					on:submit|preventDefault={() => {
-						submitHandler();
-					}}
-				>
+				{#if awaitingVerification}
+					<!-- Email verification pending view -->
+					<div class=" flex flex-col justify-center bg-white py-6 sm:py-16 px-6 sm:px-16 rounded-2xl">
+						<div class=" text-xl sm:text-2xl font-bold text-center mb-6">
+							Check Your Email
+						</div>
+						
+						<div class="flex flex-col items-center space-y-4">
+							<div class="rounded-full bg-blue-100 p-4">
+								<svg class="w-8 h-8 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+									<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 8l7.89 4.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"></path>
+								</svg>
+							</div>
+							
+							<div class="text-center">
+								<h3 class="text-lg font-semibold mb-2">Verification Email Sent!</h3>
+								<p class="text-gray-600 mb-4">
+									We've sent a verification link to <strong>{registeredEmail}</strong>. 
+									Please check your email and click the link to activate your account.
+								</p>
+								
+								<div class="text-sm text-gray-500 mb-6">
+									<p>Didn't receive the email? Check your spam folder or:</p>
+								</div>
+								
+								<button
+									on:click={resendEmailHandler}
+									type="button"
+									class="bg-blue-600 hover:bg-blue-700 text-white font-semibold text-sm py-2 px-4 rounded-full transition"
+								>
+									Resend Verification Email
+								</button>
+							</div>
+						</div>
+						
+						<div class="mt-6 text-center">
+							<button
+								on:click={() => {
+									awaitingVerification = false;
+									mode = 'signin';
+								}}
+								type="button"
+								class="text-sm text-blue-600 hover:text-blue-800 underline"
+							>
+								Back to Sign In
+							</button>
+						</div>
+					</div>
+				{:else}
+					<!-- Normal auth form -->
+					<form
+						class=" flex flex-col justify-center bg-white py-6 sm:py-16 px-6 sm:px-16 rounded-2xl"
+						on:submit|preventDefault={() => {
+							submitHandler();
+						}}
+					>
 					<div class=" text-xl sm:text-2xl font-bold">
 						{mode === 'signin' ? 'Sign in' : 'Sign up'} to {$WEBUI_NAME}
 					</div>
@@ -161,6 +233,7 @@
 						</div>
 					</div>
 				</form>
+				{/if}
 			</div>
 		</div>
 	</div>
