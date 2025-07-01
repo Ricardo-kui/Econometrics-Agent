@@ -166,6 +166,7 @@ class Role(SerializationMixin, ContextMixin, BaseModel):
     # builtin variables
     recovered: bool = False  # to tag if a recovered role
     latest_observed_msg: Optional[Message] = None  # record the latest observed message when interrupted
+    current_user_id: Optional[str] = None  # track current user for token logging
 
     __hash__ = object.__hash__  # support Role as hashable type in `Environment.members`
 
@@ -552,6 +553,9 @@ class Role(SerializationMixin, ContextMixin, BaseModel):
     @role_raise_decorator
     async def run(self, with_message=None, user_id="") -> Message | None:
         """Observe, and think and act based on the results of the observation"""
+        # Store user_id for token logging
+        self.current_user_id = user_id
+        
         if with_message:
             msg = None
             if isinstance(with_message, str):

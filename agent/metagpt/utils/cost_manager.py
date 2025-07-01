@@ -20,6 +20,11 @@ class Costs(NamedTuple):
     total_completion_tokens: int
     total_cost: float
     total_budget: float
+    
+    @property
+    def total_tokens(self) -> int:
+        """Get the total number of tokens (prompt + completion)"""
+        return self.total_prompt_tokens + self.total_completion_tokens
 
 
 class CostManager(BaseModel):
@@ -89,6 +94,23 @@ class CostManager(BaseModel):
     def get_costs(self) -> Costs:
         """Get all costs"""
         return Costs(self.total_prompt_tokens, self.total_completion_tokens, self.total_cost, self.total_budget)
+
+    def get_token_summary(self) -> str:
+        """Get a formatted string summary of token usage"""
+        total_tokens = self.total_prompt_tokens + self.total_completion_tokens
+        return f"Total: {total_tokens:,} tokens (prompt: {self.total_prompt_tokens:,}, completion: {self.total_completion_tokens:,}) | Cost: ${self.total_cost:.4f}"
+
+    def get_session_usage(self, start_costs: "Costs") -> dict:
+        """Calculate usage for the current session since start_costs"""
+        session_prompt = self.total_prompt_tokens - start_costs.total_prompt_tokens
+        session_completion = self.total_completion_tokens - start_costs.total_completion_tokens
+        session_cost = self.total_cost - start_costs.total_cost
+        return {
+            "prompt_tokens": session_prompt,
+            "completion_tokens": session_completion,
+            "total_tokens": session_prompt + session_completion,
+            "cost": session_cost
+        }
 
 
 class TokenCostManager(CostManager):

@@ -59,7 +59,7 @@ class OpenAILLM(BaseLLM):
         self.config = config
         self._init_client()
         self.auto_max_tokens = False
-        self.cost_manager: Optional[CostManager] = None
+        self.cost_manager: Optional[CostManager] = CostManager() if config.calc_usage else None
 
     def _init_client(self):
         """https://github.com/openai/openai-python#async-usage"""
@@ -119,7 +119,7 @@ class OpenAILLM(BaseLLM):
             # Some services do not provide the usage attribute, such as OpenAI or OpenLLM
             usage = self._calc_usage(messages, full_reply_content)
 
-        self._update_costs(usage)
+        self._update_costs(usage, model=self.model)
         return full_reply_content
 
     def _cons_kwargs(self, messages: list[dict], timeout=USE_CONFIG_TIMEOUT, **extra_kwargs) -> dict:
@@ -139,7 +139,7 @@ class OpenAILLM(BaseLLM):
     async def _achat_completion(self, messages: list[dict], timeout=USE_CONFIG_TIMEOUT) -> ChatCompletion:
         kwargs = self._cons_kwargs(messages, timeout=self.get_timeout(timeout))
         rsp: ChatCompletion = await self.aclient.chat.completions.create(**kwargs)
-        self._update_costs(rsp.usage)
+        self._update_costs(rsp.usage, model=self.model)
         return rsp
 
     async def acompletion(self, messages: list[dict], timeout=USE_CONFIG_TIMEOUT) -> ChatCompletion:
@@ -166,7 +166,7 @@ class OpenAILLM(BaseLLM):
         messages = self.format_msg(messages)
         kwargs = self._cons_kwargs(messages=messages, timeout=self.get_timeout(timeout), **chat_configs)
         rsp: ChatCompletion = await self.aclient.chat.completions.create(**kwargs)
-        self._update_costs(rsp.usage)
+        self._update_costs(rsp.usage, model=self.model)
         return rsp
 
     async def aask_code(self, messages: list[dict], timeout: int = USE_CONFIG_TIMEOUT, **kwargs) -> dict:

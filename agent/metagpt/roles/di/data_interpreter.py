@@ -76,7 +76,8 @@ class DataInterpreter(Role):
             return True
 
         prompt = REACT_THINK_PROMPT.format(user_requirement=user_requirement, context=context)
-        rsp = await self.llm.aask(prompt)
+        print(f"[DEBUG] DataInterpreter _think - current_user_id: {self.current_user_id}")
+        rsp = await self.llm.aask(prompt, user_id=self.current_user_id, action_description="Think - Decide next action")
         rsp_dict = json.loads(CodeParser.parse_code(block=None, text=rsp))
         self.working_memory.add(Message(content=rsp_dict["thoughts"], role="assistant"))
         need_action = rsp_dict["state"]

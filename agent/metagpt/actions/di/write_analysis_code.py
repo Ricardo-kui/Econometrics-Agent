@@ -30,7 +30,7 @@ class WriteAnalysisCode(Action):
         )
         for i in range(2):
             try:
-                rsp = await self._aask(reflection_prompt, system_msgs=[REFLECTION_SYSTEM_MSG])
+                rsp = await self._aask(reflection_prompt, system_msgs=[REFLECTION_SYSTEM_MSG], user_id=user_id, action_description="Code reflection")
                 print("===========Reflection Response===========")
                 print(CodeParser.parse_code(block=None, text=rsp))
                 reflection = json.loads(CodeParser.parse_code(block=None, text=rsp))
@@ -59,6 +59,7 @@ class WriteAnalysisCode(Action):
         user_id: str = "",
         **kwargs,
     ) -> str:
+        print(f"[DEBUG] WriteAnalysisCode.run - user_id: {user_id}")
 
         if self.llm.cost_manager.total_cost >= self.llm.cost_manager.max_budget:
             await log_execution("### ❗ ❗ ❗ You have exceeded the single task token budget, please restart a conversation session\n", user_id)
@@ -78,7 +79,7 @@ class WriteAnalysisCode(Action):
         if use_reflection:
             code = await self._debug_with_reflection(context=context, working_memory=working_memory, user_id=user_id)
         else:
-            rsp = await self.llm.aask(context, system_msgs=[INTERPRETER_SYSTEM_MSG], **kwargs)
+            rsp = await self.llm.aask(context, system_msgs=[INTERPRETER_SYSTEM_MSG], user_id=user_id, action_description="Generate analysis code", **kwargs)
             code = CodeParser.parse_code(block=None, text=rsp)
 
         return code

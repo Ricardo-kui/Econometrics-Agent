@@ -42,6 +42,10 @@ class BaseLLM(ABC):
     cost_manager: Optional[CostManager] = None
     model: Optional[str] = None  # deprecated
     pricing_plan: Optional[str] = None
+    
+    # Token logging context
+    _current_user_id: Optional[str] = None
+    _current_action_description: Optional[str] = None
 
     @abstractmethod
     def __init__(self, config: LLMConfig):
@@ -102,6 +106,16 @@ class BaseLLM(ABC):
     def _default_system_msg(self):
         return self._system_msg(self.system_prompt)
 
+    def set_token_logging_context(self, user_id: str = None, action_description: str = ""):
+        """Set context for token logging"""
+        self._current_user_id = user_id
+        self._current_action_description = action_description
+
+    def clear_token_logging_context(self):
+        """Clear the token logging context"""
+        self._current_user_id = None
+        self._current_action_description = None
+
     def _update_costs(self, usage: Union[dict, BaseModel], model: str = None, local_calc_usage: bool = True):
         """update each request's token cost
         Args:
@@ -112,11 +126,85 @@ class BaseLLM(ABC):
         model = model or self.pricing_plan
         model = model or self.model
         usage = usage.model_dump() if isinstance(usage, BaseModel) else usage
-        if calc_usage and self.cost_manager and usage:
+        prompt_tokens = 0
+        completion_tokens = 0
+        
+        # Enhanced token extraction with fallback mechanisms
+        if calc_usage and self.cost_manager:
             try:
-                prompt_tokens = int(usage.get("prompt_tokens", 0))
-                completion_tokens = int(usage.get("completion_tokens", 0))
-                self.cost_manager.update_cost(prompt_tokens, completion_tokens, model)
+                print(f"[TOKEN_DEBUG] Raw usage data: {usage}")
+                print(f"[TOKEN_DEBUG] Model: {model}, Config calc_usage: {self.config.calc_usage}")
+                
+                if usage:
+                    prompt_tokens = int(usage.get("prompt_tokens", 0))
+                    completion_tokens = int(usage.get("completion_tokens", 0))
+                    print(f"[TOKEN_DEBUG] API returned tokens - prompt: {prompt_tokens}, completion: {completion_tokens}")
+                
+                # Fallback: If API doesn't return token counts, estimate using tiktoken
+                if prompt_tokens == 0 and completion_tokens == 0 and hasattr(self, '_last_messages') and hasattr(self, '_last_response'):
+                    print(f"[TOKEN_DEBUG] API returned 0 tokens, attempting fallback calculation...")
+                    try:
+                        from metagpt.utils.token_counter import count_input_tokens, count_output_tokens
+                        
+                        if hasattr(self, '_last_messages') and self._last_messages:
+                            prompt_tokens = count_input_tokens(self._last_messages, model)
+                            print(f"[TOKEN_DEBUG] Fallback prompt tokens: {prompt_tokens}")
+                        
+                        if hasattr(self, '_last_response') and self._last_response:
+                            completion_tokens = count_output_tokens(self._last_response, model)
+                            print(f"[TOKEN_DEBUG] Fallback completion tokens: {completion_tokens}")
+                    except Exception as fallback_error:
+                        print(f"[TOKEN_DEBUG] Fallback calculation failed: {fallback_error}")
+                
+                # Update cost manager with actual or estimated tokens
+                if prompt_tokens > 0 or completion_tokens > 0:
+                    self.cost_manager.update_cost(prompt_tokens, completion_tokens, model)
+                
+                # Always display token information
+                total_tokens = prompt_tokens + completion_tokens
+                print(f"\n💰 LLM TOKEN USAGE:")
+                print(f"   📝 Input Tokens:  {prompt_tokens:,}")
+                print(f"   📤 Output Tokens: {completion_tokens:,}")
+                print(f"   🔢 Total Tokens:  {total_tokens:,}")
+                print(f"   🤖 Model: {model}")
+                
+                # Calculate and display cost
+                cost = 0.0
+                if hasattr(self.cost_manager, 'token_costs') and model in self.cost_manager.token_costs:
+                    cost = (prompt_tokens * self.cost_manager.token_costs[model]["prompt"] + 
+                           completion_tokens * self.cost_manager.token_costs[model]["completion"]) / 1000
+                    print(f"   💵 Cost: ${cost:.4f}")
+                else:
+                    print(f"   💵 Cost: Unknown (model '{model}' not in pricing table)")
+                
+                # Get cumulative costs
+                total_costs = self.cost_manager.get_costs() if self.cost_manager else None
+                if total_costs:
+                    print(f"   📊 Session Total: {total_costs.total_prompt_tokens:,} prompt + {total_costs.total_completion_tokens:,} completion = {total_costs.total_tokens:,} total")
+                    print(f"   💰 Session Cost: ${total_costs.total_cost:.4f}")
+                print()
+                
+                # Log token usage to user's queue if context is available
+                if self._current_user_id and total_tokens > 0:
+                    print(f"[TOKEN_DEBUG] Logging tokens for user_id: {self._current_user_id}, action: {self._current_action_description}")
+                    # Import here to avoid circular import
+                    import asyncio
+                    from shared_queue import log_token_usage
+                    
+                    # Log asynchronously
+                    try:
+                        loop = asyncio.get_event_loop()
+                        loop.create_task(log_token_usage(self._current_user_id, prompt_tokens, completion_tokens, cost, model, self._current_action_description or ""))
+                        print(f"[TOKEN_DEBUG] Token usage logging task created successfully")
+                    except RuntimeError as e:
+                        # If no event loop is running, we can't log - that's okay
+                        print(f"[TOKEN_DEBUG] RuntimeError in token logging: {e}")
+                        pass
+                elif total_tokens == 0:
+                    print(f"[TOKEN_DEBUG] Not logging - no tokens consumed")
+                else:
+                    print(f"[TOKEN_DEBUG] Not logging - no user_id: {self._current_user_id}")
+                        
             except Exception as e:
                 logger.error(f"{self.__class__.__name__} updates costs failed! exp: {e}")
 
@@ -133,6 +221,8 @@ class BaseLLM(ABC):
         images: Optional[Union[str, list[str]]] = None,
         timeout=USE_CONFIG_TIMEOUT,
         stream=None,
+        user_id: Optional[str] = None,
+        action_description: str = "",
     ) -> str:
         if system_msgs:
             message = self._system_msgs(system_msgs)
@@ -149,7 +239,32 @@ class BaseLLM(ABC):
         if stream is None:
             stream = self.config.stream
         logger.debug(message)
+        
+        # Store user_id and action_description temporarily for token logging (only if provided)
+        original_user_id = self._current_user_id
+        original_action_description = self._current_action_description
+        
+        if user_id:
+            self._current_user_id = user_id
+        if action_description:
+            self._current_action_description = action_description
+            
+        print(f"[DEBUG] aask method - using user_id: {self._current_user_id}, action: {self._current_action_description}")
+        
+        # Store messages for fallback token calculation
+        self._last_messages = message
+        
         rsp = await self.acompletion_text(message, stream=stream, timeout=self.get_timeout(timeout))
+        
+        # Store response for fallback token calculation
+        self._last_response = rsp
+        
+        # Restore the original values (don't clear if they were set by set_token_logging_context)
+        if user_id:
+            self._current_user_id = original_user_id
+        if action_description:
+            self._current_action_description = original_action_description
+        
         return rsp
 
     def _extract_assistant_rsp(self, context):
