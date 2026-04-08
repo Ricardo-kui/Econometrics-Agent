@@ -1,5 +1,9 @@
 # Econometrics AI Agent
 
+## Lightweight Local CLI Rewrite
+
+If you want a controllable local reimplementation without MetaGPT or the web UI, see [README_LITE.md](./README_LITE.md) and run [`lite_econometrics_agent.py`](./lite_econometrics_agent.py).
+
 This repository hosts the official implementation for the research paper: "[Can AI Master Econometrics? Evidence from Econometrics AI Agent on Expert-Level Tasks](https://arxiv.org/abs/2506.00856)".
 
 The **Econometrics AI Agent** is an LLM-driven, specialized AI agent designed to automate complex econometric analysis, traditionally requiring significant human expertise. This project addresses the challenge of applying AI to intricate, domain-specific tasks where general-purpose Large Language Models (LLMs) and AI agents often fall short without costly fine-tuning or specialized retraining.
