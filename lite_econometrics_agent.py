@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 import difflib
@@ -53,6 +53,8 @@ class AnalysisSpec:
     hac_maxlags: int = 1
     export_balance: str | None = None
     export_terms: str | None = None
+    export_narrative: str | None = None
+    label_map: str | None = None
     model: str = "auto"
     lead_window: int = 4
     lag_window: int = 3
@@ -575,7 +577,7 @@ class EconometricTools:
         )
 
     @staticmethod
-    def fit_rdd(df: pd.DataFrame, spec: AnalysisSpec) -> FitBundle:
+    def fit_rdd(df: pd.DataFrame, spec: AnalysisSpec, compute_sensitivity: bool = True) -> FitBundle:
         if spec.running_variable is None or spec.cutoff is None:
             raise ValueError("RDD requires --running-variable and --cutoff.")
         if not is_binary_like(df[spec.treatment]):
@@ -598,12 +600,13 @@ class EconometricTools:
                 "n_right": int((selected[spec.running_variable] >= spec.cutoff).sum()),
                 "rdd_mode": spec.rdd_mode,
                 "poly_order": spec.poly_order,
+                "sensitivity": EconometricTools._rdd_sensitivity(df, spec, fuzzy=False) if compute_sensitivity else [],
                 "priority_terms": [spec.treatment],
             },
         )
 
     @staticmethod
-    def fit_fuzzy_rdd(df: pd.DataFrame, spec: AnalysisSpec) -> FitBundle:
+    def fit_fuzzy_rdd(df: pd.DataFrame, spec: AnalysisSpec, compute_sensitivity: bool = True) -> FitBundle:
         if spec.running_variable is None or spec.cutoff is None:
             raise ValueError("Fuzzy RDD requires --running-variable and --cutoff.")
 
@@ -627,6 +630,7 @@ class EconometricTools:
                 "n_right": int((selected[spec.running_variable] >= spec.cutoff).sum()),
                 "rdd_mode": spec.rdd_mode,
                 "poly_order": spec.poly_order,
+                "sensitivity": EconometricTools._rdd_sensitivity(df, spec, fuzzy=True) if compute_sensitivity else [],
                 "priority_terms": [spec.treatment],
             },
         )
@@ -816,6 +820,36 @@ class EconometricTools:
         return selected, bandwidth
 
     @staticmethod
+    def _rdd_sensitivity(df: pd.DataFrame, spec: AnalysisSpec, *, fuzzy: bool) -> list[dict[str, Any]]:
+        sensitivity: list[dict[str, Any]] = []
+        if spec.rdd_mode == "global-poly":
+            for order in range(1, max(spec.poly_order, 1) + 1):
+                alt_spec = replace(spec, poly_order=order, rdd_mode="global-poly")
+                try:
+                    bundle = (EconometricTools.fit_fuzzy_rdd if fuzzy else EconometricTools.fit_rdd)(df, alt_spec, compute_sensitivity=False)
+                    term = alt_spec.treatment
+                    sensitivity.append({"poly_order": order, "estimate": round(float(bundle.result.params[term]), 6)})
+                except Exception:
+                    continue
+        else:
+            selected_bandwidths = []
+            if spec.bandwidth:
+                selected_bandwidths = [0.5 * spec.bandwidth, 1.5 * spec.bandwidth]
+            else:
+                running = df[spec.running_variable].astype(float)
+                base_bw = max(running.max() - spec.cutoff, spec.cutoff - running.min())
+                selected_bandwidths = [0.5 * base_bw, 1.5 * base_bw]
+            for bw in selected_bandwidths:
+                alt_spec = replace(spec, bandwidth=float(bw), rdd_mode="local-linear")
+                try:
+                    bundle = (EconometricTools.fit_fuzzy_rdd if fuzzy else EconometricTools.fit_rdd)(df, alt_spec, compute_sensitivity=False)
+                    term = alt_spec.treatment
+                    sensitivity.append({"bandwidth": round(float(bw), 6), "estimate": round(float(bundle.result.params[term]), 6)})
+                except Exception:
+                    continue
+        return sensitivity
+
+    @staticmethod
     def _build_sharp_rdd_design(selected: pd.DataFrame, centered: pd.Series, bandwidth: float, spec: AnalysisSpec) -> tuple[pd.DataFrame, pd.Series | None]:
         base = pd.DataFrame(index=selected.index)
         base[spec.treatment] = selected[spec.treatment]
@@ -978,6 +1012,7 @@ class LiteEconometricsAgent:
         summary = self._build_summary(prepared, model, reasons, plan, bundle, diagnostics)
         self._maybe_export_balance(bundle)
         self._maybe_export_terms(summary)
+        self._maybe_export_narrative(summary)
         self._emit(summary)
         if self.spec.save_summary:
             Path(self.spec.save_summary).write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -1045,7 +1080,7 @@ class LiteEconometricsAgent:
     def _maybe_export_terms(self, summary: dict[str, Any]) -> None:
         if not self.spec.export_terms:
             return
-        table = pd.DataFrame(summary["all_terms"])
+        table = pd.DataFrame(summary["terms_table"])
         output_path = Path(self.spec.export_terms)
         suffix = output_path.suffix.lower()
         if suffix in {".tex", ".latex"}:
@@ -1053,6 +1088,13 @@ class LiteEconometricsAgent:
         else:
             table.to_csv(output_path, index=False)
         self.reflection_log.append(f"exported coefficient table to {output_path}")
+
+    def _maybe_export_narrative(self, summary: dict[str, Any]) -> None:
+        if not self.spec.export_narrative:
+            return
+        output_path = Path(self.spec.export_narrative)
+        output_path.write_text(self._build_narrative(summary), encoding="utf-8")
+        self.reflection_log.append(f"exported narrative to {output_path}")
 
     @staticmethod
     def _dataframe_to_latex(table: pd.DataFrame) -> str:
@@ -1080,6 +1122,105 @@ class LiteEconometricsAgent:
                 r"\end{tabular}",
             ]
         )
+
+    def _build_narrative(self, summary: dict[str, Any]) -> str:
+        card = summary["knowledge_card"]
+        main = summary["main_result"]
+        lines = [
+            f"# {card['display_name']} Narrative",
+            "",
+            "## Selection",
+            f"The agent selected `{summary['selected_model']}` for this task.",
+            f"Selection reasons: {', '.join(summary['selection_reasons'])}.",
+            "",
+            "## Identification",
+            card["identification_logic"],
+            "",
+            "## Main Result",
+            f"The reported effect term is `{summary['main_term_reported']}`.",
+            (
+                f"Point estimate = {main['coefficient']:.6f}, "
+                f"standard error = {main['std_error']:.6f}, "
+                f"p-value = {main['pvalue']:.6f}."
+            ),
+            "",
+            "## Diagnostics",
+        ]
+        lines.extend([f"- {item}" for item in summary["diagnostics"]])
+        lines.extend(["", "## Risks"])
+        lines.extend([f"- {item}" for item in card["common_failure_modes"]])
+        return "\n".join(lines) + "\n"
+
+    def _label_lookup(self) -> dict[str, str]:
+        if not self.spec.label_map:
+            return {}
+        candidate = self.spec.label_map.strip()
+        path = Path(candidate)
+        try:
+            if path.exists():
+                return json.loads(path.read_text(encoding="utf-8"))
+            return json.loads(candidate)
+        except Exception:
+            self.reflection_log.append("failed to parse label_map; falling back to raw term names")
+            return {}
+
+    def _build_terms_table(self, result: Any) -> pd.DataFrame:
+        label_map = self._label_lookup()
+        se_series = getattr(result, "std_errors", getattr(result, "bse", None))
+        p_series = result.pvalues
+        ci = self._confidence_intervals(result, se_series)
+
+        def stars(p: float) -> str:
+            if pd.isna(p):
+                return ""
+            if p < 0.01:
+                return "***"
+            if p < 0.05:
+                return "**"
+            if p < 0.1:
+                return "*"
+            return ""
+
+        rows = []
+        for term in result.params.index:
+            coef = float(result.params[term])
+            se = float(se_series[term]) if se_series is not None and term in se_series.index else np.nan
+            pval = float(p_series[term]) if term in p_series.index else np.nan
+            ci_low = float(ci.loc[term, "lower"])
+            ci_high = float(ci.loc[term, "upper"])
+            rows.append(
+                {
+                    "term": term,
+                    "label": label_map.get(term, term),
+                    "coef": coef,
+                    "std_error": se,
+                    "pvalue": pval,
+                    "ci_low": ci_low,
+                    "ci_high": ci_high,
+                    "stars": stars(pval),
+                    "coef_display": f"{coef:.3f}{stars(pval)}",
+                    "se_display": "" if pd.isna(se) else f"({se:.3f})",
+                    "ci_display": "" if pd.isna(ci_low) or pd.isna(ci_high) else f"[{ci_low:.3f}, {ci_high:.3f}]",
+                }
+            )
+        return pd.DataFrame(rows)
+
+    @staticmethod
+    def _confidence_intervals(result: Any, se_series: pd.Series | None) -> pd.DataFrame:
+        if hasattr(result, "conf_int"):
+            try:
+                ci = result.conf_int()
+                if isinstance(ci, pd.DataFrame) and ci.shape[1] >= 2:
+                    ci = ci.iloc[:, :2].copy()
+                    ci.columns = ["lower", "upper"]
+                    return ci
+            except Exception:
+                pass
+        if se_series is None:
+            se_series = pd.Series(np.nan, index=result.params.index)
+        lower = result.params - 1.96 * se_series
+        upper = result.params + 1.96 * se_series
+        return pd.DataFrame({"lower": lower, "upper": upper})
 
     def _prepare_data(self, df: pd.DataFrame, model: str) -> pd.DataFrame:
         frame = df.copy()
@@ -1289,6 +1430,8 @@ class LiteEconometricsAgent:
             )
             if bundle.extras.get("rdd_mode") == "global-poly":
                 diagnostics.append(f"RDD global polynomial order: {bundle.extras.get('poly_order')}")
+            if bundle.extras.get("sensitivity"):
+                diagnostics.append(f"RDD sensitivity: {bundle.extras.get('sensitivity')}")
 
         if model == "fuzzy-rdd":
             diagnostics.append(
@@ -1296,6 +1439,8 @@ class LiteEconometricsAgent:
             )
             if bundle.extras.get("rdd_mode") == "global-poly":
                 diagnostics.append(f"Fuzzy RDD global polynomial order: {bundle.extras.get('poly_order')}")
+            if bundle.extras.get("sensitivity"):
+                diagnostics.append(f"Fuzzy RDD sensitivity: {bundle.extras.get('sensitivity')}")
             if hasattr(result, "first_stage"):
                 try:
                     first_stage = result.first_stage.diagnostics
@@ -1322,6 +1467,7 @@ class LiteEconometricsAgent:
         term = bundle.main_term
         se_series = getattr(result, "std_errors", getattr(result, "bse", None))
         r2 = getattr(result, "rsquared_adj", getattr(result, "rsquared", None))
+        terms_table = self._build_terms_table(result)
         terms = pd.DataFrame(
             {
                 "term": list(result.params.index),
@@ -1365,16 +1511,36 @@ class LiteEconometricsAgent:
                 "pvalue": round(float(result.pvalues[term]), 6),
                 "r_squared": None if r2 is None else round(float(r2), 6),
             },
+            "method_details": self._serialize_extras(bundle.extras),
             "diagnostics": diagnostics,
             "reflection": self.reflection_log,
             "all_terms": terms.to_dict(orient="records"),
+            "terms_table": terms_table.to_dict(orient="records"),
         }
 
     def _emit(self, summary: dict[str, Any]) -> None:
         print("\n=== Lightweight Econometrics Agent v2 ===")
-        print(json.dumps({k: v for k, v in summary.items() if k != "all_terms"}, indent=2, ensure_ascii=False))
+        print(json.dumps({k: v for k, v in summary.items() if k not in {"all_terms", "terms_table"}}, indent=2, ensure_ascii=False))
         print("\n=== Coefficient Table ===")
-        print(pd.DataFrame(summary["all_terms"]).to_string(index=False))
+        print(pd.DataFrame(summary["terms_table"])[["label", "coef_display", "se_display", "pvalue", "ci_display"]].to_string(index=False))
+
+    @staticmethod
+    def _serialize_extras(extras: dict[str, Any]) -> dict[str, Any]:
+        def clean(value: Any):
+            if isinstance(value, pd.DataFrame):
+                return None
+            if isinstance(value, pd.Series):
+                return None
+            if isinstance(value, dict):
+                cleaned = {k: clean(v) for k, v in value.items()}
+                return {k: v for k, v in cleaned.items() if v is not None}
+            if isinstance(value, list):
+                cleaned = [clean(v) for v in value]
+                return [v for v in cleaned if v is not None]
+            return value
+
+        serialized = clean(extras)
+        return serialized if isinstance(serialized, dict) else {}
 
     @staticmethod
     def _resolve_column(df: pd.DataFrame, requested: str) -> str:
@@ -1624,6 +1790,8 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--hac-maxlags", type=int, default=1)
     run_parser.add_argument("--export-balance")
     run_parser.add_argument("--export-terms")
+    run_parser.add_argument("--export-narrative")
+    run_parser.add_argument("--label-map")
     run_parser.add_argument("--model", choices=["auto", "ols", "fe", "iv", "did", "event-study", "psm", "ipw", "aipw", "ipwra", "rdd", "fuzzy-rdd"], default="auto")
     run_parser.add_argument("--lead-window", type=int, default=4)
     run_parser.add_argument("--lag-window", type=int, default=3)
@@ -1675,6 +1843,8 @@ def main() -> None:
         hac_maxlags=args.hac_maxlags,
         export_balance=args.export_balance,
         export_terms=args.export_terms,
+        export_narrative=args.export_narrative,
+        label_map=args.label_map,
         model=args.model,
         lead_window=args.lead_window,
         lag_window=args.lag_window,

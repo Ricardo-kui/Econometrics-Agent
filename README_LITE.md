@@ -2,7 +2,7 @@
 
 这个版本不是复刻原仓库的 MetaGPT + Web UI，而是把它最有价值的能力压缩成一个可控、可解释、可在本地 CLI 直接运行的小 agent。
 
-现在它已经从“最小可运行版”升级成“知识驱动版”，不只会跑模型，还会显式输出方法知识卡、选模依据、协方差设定和识别风险提示。
+现在它已经从“最小可运行版”升级成“知识驱动版”，不只会跑模型，还会显式输出方法知识卡、选模依据、协方差设定、RDD 敏感性检查和识别风险提示。
 
 ## 原项目中保留了什么
 
@@ -285,7 +285,45 @@ python lite_econometrics_agent.py run \
   --export-terms regression_terms.tex
 ```
 
-### 18. 一键演示 OLS / FE / DID / Event Study / PSM / IPW / AIPW / IPWRA / Sharp RDD / Fuzzy RDD / IV
+### 18. 导出论文式方法叙述
+
+```bash
+python lite_econometrics_agent.py run \
+  --data my_data.csv \
+  --query "baseline ols" \
+  --outcome y \
+  --treatment treat \
+  --controls x1 x2 \
+  --export-narrative methods_and_results.md
+```
+
+### 19. 使用 label map 美化表格变量名
+
+先准备一个 JSON：
+
+```json
+{
+  "const": "Intercept",
+  "treat": "Treatment",
+  "x1": "Firm Size",
+  "x2": "Leverage"
+}
+```
+
+然后：
+
+```bash
+python lite_econometrics_agent.py run \
+  --data my_data.csv \
+  --query "baseline ols" \
+  --outcome y \
+  --treatment treat \
+  --controls x1 x2 \
+  --label-map labels.json \
+  --export-terms regression_terms.csv
+```
+
+### 20. 一键演示 OLS / FE / DID / Event Study / PSM / IPW / AIPW / IPWRA / Sharp RDD / Fuzzy RDD / IV
 
 ```bash
 python lite_econometrics_agent.py demo
@@ -301,6 +339,9 @@ python lite_econometrics_agent.py demo
 - 对 `PSM / IPW / AIPW` 会输出 balance 改善前后的 standardized mean difference 摘要
 - 可以把 propensity-score 方法的 balance 诊断导出为 CSV 表
 - 可以把系数表导出为 `csv` 或 `tex`
+- 可以导出论文式 narrative，总结方法选择、识别逻辑、主结果和风险
+- 可以通过 `label-map` 把变量名映射成更可读的表格标签
+- RDD / fuzzy RDD 会输出带宽或多项式阶数的敏感性对比
 - 所有结果都以结构化 JSON + 系数表打印
 
 ## 当前边界
