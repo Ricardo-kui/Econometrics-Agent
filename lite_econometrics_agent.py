@@ -1639,6 +1639,8 @@ def _expand_sweep_specs(expand_cfg: dict[str, list[Any]]) -> list[dict[str, Any]
 
 def _template_sweep_specs(template: str, base: dict[str, Any]) -> list[dict[str, Any]]:
     template = template.lower()
+    if template == "smart":
+        return _template_sweep_specs(_suggest_sweep_template(base), base)
     if template == "ols-covariance":
         return [
             {"name": "robust", "model": "ols", "cov_type": "robust"},
@@ -1663,6 +1665,58 @@ def _template_sweep_specs(template: str, base: dict[str, Any]) -> list[dict[str,
             {"name": "fe_cluster_both", "model": "fe", "cov_type": "cluster-both"},
         ]
     raise ValueError(f"Unknown sweep template: {template}")
+
+
+def _suggest_sweep_template(base: dict[str, Any]) -> str:
+    model = str(base.get("model", "")).lower()
+    query = str(base.get("query", "")).lower()
+    if base.get("running_variable") and base.get("cutoff") is not None:
+        return "rdd-sensitivity"
+    if base.get("entity_id") and base.get("time_id"):
+        return "panel-covariance"
+    if model in {"psm", "ipw", "aipw", "ipwra"}:
+        return "pscore-suite"
+    if any(keyword in query for keyword in ["matching", "propensity", "ipw", "aipw", "ipwra"]):
+        return "pscore-suite"
+    return "ols-covariance"
+
+
+def _normalize_stats_rows(stats_rows: list[Any]) -> list[dict[str, str]]:
+    normalized = []
+    for item in stats_rows:
+        if isinstance(item, dict):
+            normalized.append({"key": item["key"], "label": item.get("label", item["key"])})
+        else:
+            normalized.append({"key": str(item), "label": str(item)})
+    return normalized
+
+
+def _extract_stat_value(run: SweepRun, key: str) -> str:
+    summary = run.summary
+    method = summary.get("method_details", {})
+    lowered = key.lower()
+    if lowered == "n":
+        return str(summary["data_rows_used"])
+    if lowered == "r2":
+        r2 = summary["main_result"]["r_squared"]
+        return "" if r2 is None else f"{r2:.3f}"
+    if lowered == "model":
+        return str(summary["selected_model"])
+    if lowered == "covariance":
+        return str(summary.get("cov_type", ""))
+    if lowered == "estimand":
+        return str(summary.get("estimand", ""))
+    if lowered == "bandwidth":
+        value = method.get("bandwidth_used", summary.get("bandwidth"))
+        return "" if value is None else f"{float(value):.3f}"
+    if lowered == "polyorder":
+        value = method.get("poly_order", summary.get("poly_order"))
+        return "" if value is None else str(value)
+    if lowered == "rddmode":
+        return str(method.get("rdd_mode", summary.get("rdd_mode", "")))
+    if lowered == "mainterm":
+        return str(summary.get("main_term_reported", ""))
+    return str(method.get(key, summary.get(key, "")))
 
 
 def load_sweep_config(config_path: str) -> dict[str, Any]:
@@ -1706,10 +1760,10 @@ def build_models_table(runs: list[SweepRun], table_options: dict[str, Any] | Non
     table_options = table_options or {}
     drop_terms = set(table_options.get("drop_terms", []))
     preferred_order = table_options.get("row_order", [])
-    stats_rows = table_options.get("stats_rows", ["N", "R2"])
+    stats_rows = _normalize_stats_rows(table_options.get("stats_rows", ["N", "R2"]))
     model_labels = table_options.get("model_labels", {})
 
-    row_order: list[str] = []
+    row_specs: list[dict[str, str]] = []
     seen_labels: set[str] = set()
     for run in runs:
         for record in run.summary["terms_table"]:
@@ -1718,35 +1772,33 @@ def build_models_table(runs: list[SweepRun], table_options: dict[str, Any] | Non
             label = record["label"]
             if label not in seen_labels:
                 seen_labels.add(label)
-                row_order.extend([label, f"{label}__se"])
+                row_specs.extend(
+                    [
+                        {"type": "coef", "label": label, "term_label": label},
+                        {"type": "se", "label": f"{label} (SE)", "term_label": label},
+                    ]
+                )
 
     if preferred_order:
-        ordered_rows = []
+        ordered_specs = []
         for label in preferred_order:
-            if label in seen_labels:
-                ordered_rows.extend([label, f"{label}__se"])
-        for label in seen_labels:
-            if label not in preferred_order:
-                ordered_rows.extend([label, f"{label}__se"])
-        row_order = ordered_rows
+            ordered_specs.extend([spec for spec in row_specs if spec["term_label"] == label])
+        ordered_specs.extend([spec for spec in row_specs if spec["term_label"] not in preferred_order])
+        row_specs = ordered_specs
 
-    row_order.extend(stats_rows)
-    table = pd.DataFrame({"row_label": [label.replace("__se", " (SE)") for label in row_order]})
+    row_specs.extend([{"type": "stat", "label": item["label"], "key": item["key"]} for item in stats_rows])
+    table = pd.DataFrame({"row_label": [spec["label"] for spec in row_specs]})
 
     for run in runs:
         column = []
         lookup = {record["label"]: record for record in run.summary["terms_table"]}
-        for row in row_order:
-            if row == "N":
-                column.append(str(run.summary["data_rows_used"]))
-            elif row == "R2":
-                r2 = run.summary["main_result"]["r_squared"]
-                column.append("" if r2 is None else f"{r2:.3f}")
-            elif row.endswith("__se"):
-                key = row[:-4]
-                column.append(lookup.get(key, {}).get("se_display", ""))
+        for spec in row_specs:
+            if spec["type"] == "stat":
+                column.append(_extract_stat_value(run, spec["key"]))
+            elif spec["type"] == "se":
+                column.append(lookup.get(spec["term_label"], {}).get("se_display", ""))
             else:
-                column.append(lookup.get(row, {}).get("coef_display", ""))
+                column.append(lookup.get(spec["term_label"], {}).get("coef_display", ""))
         table[model_labels.get(run.name, run.name)] = column
     return table
 
@@ -1851,6 +1903,11 @@ def build_results_paragraph(runs: list[SweepRun]) -> str:
         if significant == len(runs)
         else f"{significant} of {len(runs)} specifications are statistically informative at the 10% level"
     )
+    robustness_phrase = (
+        "The magnitude is very stable across specifications."
+        if spread < 0.1
+        else "The magnitude varies non-trivially across specifications, so robustness should be interpreted with caution."
+    )
     range_phrase = (
         f"the point estimate is effectively unchanged at {effects[0]:.3f}"
         if spread < 1e-3
@@ -1865,7 +1922,7 @@ def build_results_paragraph(runs: list[SweepRun]) -> str:
             f"More specifically, {range_phrase}, and {significance_phrase}. "
             f"In the leading specification ({leading.name}, {lead_model}), the reported estimate is "
             f"{lead_main['coefficient']:.3f} with standard error {lead_main['std_error']:.3f}. "
-            f"{consistency}"
+            f"{consistency} {robustness_phrase}"
         ),
     ]
     return "\n".join(paragraph) + "\n"

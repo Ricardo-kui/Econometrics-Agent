@@ -369,6 +369,14 @@ python lite_econometrics_agent.py sweep \
 - `pscore-suite`
 - `rdd-sensitivity`
 - `panel-covariance`
+- `smart`
+
+其中 `smart` 会根据 `base_spec` 自动选择一个更合适的模板：
+
+- 有 `running_variable + cutoff`：优先 `rdd-sensitivity`
+- 有 `entity_id + time_id`：优先 `panel-covariance`
+- 明显是 propensity-score 任务：优先 `pscore-suite`
+- 否则：回退到 `ols-covariance`
 
 例如：
 
@@ -415,6 +423,16 @@ python lite_econometrics_agent.py sweep \
 - `depvar_label`
 - `notes`
 
+`stats_rows` 不只支持 `N / R2`，也支持常用自定义项，例如：
+
+- `Model`
+- `Covariance`
+- `Estimand`
+- `Bandwidth`
+- `PolyOrder`
+- `RDDMode`
+- `MainTerm`
+
 ## 可解释性原则
 
 - 自动选模只用明确规则，不做黑箱决策
@@ -431,6 +449,8 @@ python lite_econometrics_agent.py sweep \
 - 可以通过 `sweep` 子命令把多个规格合并成并列表和结果段落
 - `sweep` 支持 `template`、`expand` 和 `table` 三层配置
 - 多模型表支持 `group_headers / notes / row_order / drop_terms / model_labels / title / depvar_label`
+- `smart` template 可以基于 `base_spec` 自动挑选一组更合理的稳健性规格
+- `stats_rows` 允许把 `Covariance / Estimand / Bandwidth / PolyOrder` 等信息直接压进并列表
 - 所有结果都以结构化 JSON + 系数表打印
 
 ## 当前边界
