@@ -357,7 +357,20 @@ python lite_econometrics_agent.py sweep \
   --export-results-paragraph sweep_results.md
 ```
 
-`sweep.json` 还支持 `expand` 自动展开稳健性矩阵，以及 `table` 自定义导出格式。例如：
+`sweep.json` 还支持三种更高级的模式：
+
+- `template`：直接调用内置稳健性模板
+- `expand`：自动展开规格矩阵
+- `table`：自定义并列表的布局与注释
+
+内置模板包括：
+
+- `ols-covariance`
+- `pscore-suite`
+- `rdd-sensitivity`
+- `panel-covariance`
+
+例如：
 
 ```json
 {
@@ -391,6 +404,17 @@ python lite_econometrics_agent.py sweep \
 }
 ```
 
+`table` 目前支持的常用字段包括：
+
+- `drop_terms`
+- `row_order`
+- `stats_rows`
+- `model_labels`
+- `group_headers`
+- `title`
+- `depvar_label`
+- `notes`
+
 ## 可解释性原则
 
 - 自动选模只用明确规则，不做黑箱决策
@@ -405,7 +429,8 @@ python lite_econometrics_agent.py sweep \
 - 可以通过 `label-map` 把变量名映射成更可读的表格标签
 - RDD / fuzzy RDD 会输出带宽或多项式阶数的敏感性对比
 - 可以通过 `sweep` 子命令把多个规格合并成并列表和结果段落
-- `sweep` 支持 `expand` 自动展开规格矩阵，支持 `group_headers / notes / row_order / drop_terms`
+- `sweep` 支持 `template`、`expand` 和 `table` 三层配置
+- 多模型表支持 `group_headers / notes / row_order / drop_terms / model_labels / title / depvar_label`
 - 所有结果都以结构化 JSON + 系数表打印
 
 ## 当前边界
