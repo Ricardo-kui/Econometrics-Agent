@@ -1637,23 +1637,59 @@ def _expand_sweep_specs(expand_cfg: dict[str, list[Any]]) -> list[dict[str, Any]
     return specs
 
 
+def _template_sweep_specs(template: str, base: dict[str, Any]) -> list[dict[str, Any]]:
+    template = template.lower()
+    if template == "ols-covariance":
+        return [
+            {"name": "robust", "model": "ols", "cov_type": "robust"},
+            {"name": "hac2", "model": "ols", "cov_type": "hac", "hac_maxlags": 2},
+        ]
+    if template == "pscore-suite":
+        return [
+            {"name": "psm", "model": "psm"},
+            {"name": "ipw", "model": "ipw"},
+            {"name": "aipw", "model": "aipw"},
+            {"name": "ipwra", "model": "ipwra"},
+        ]
+    if template == "rdd-sensitivity":
+        return [
+            {"name": "local_linear", "model": "rdd", "rdd_mode": "local-linear"},
+            {"name": "poly2", "model": "rdd", "rdd_mode": "global-poly", "poly_order": 2},
+            {"name": "poly3", "model": "rdd", "rdd_mode": "global-poly", "poly_order": 3},
+        ]
+    if template == "panel-covariance":
+        return [
+            {"name": "fe_auto", "model": "fe", "cov_type": "auto"},
+            {"name": "fe_cluster_both", "model": "fe", "cov_type": "cluster-both"},
+        ]
+    raise ValueError(f"Unknown sweep template: {template}")
+
+
 def load_sweep_config(config_path: str) -> dict[str, Any]:
     payload = json.loads(Path(config_path).read_text(encoding="utf-8"))
     if isinstance(payload, dict) and "specs" in payload:
         return payload
     elif isinstance(payload, dict) and "expand" in payload:
         return payload
+    elif isinstance(payload, dict) and "template" in payload:
+        return payload
     elif isinstance(payload, list):
         return {"base_spec": {}, "specs": payload}
     else:
-        raise ValueError("Sweep config must be a list of specs or a dict with `specs`.")
+        raise ValueError("Sweep config must be a list of specs or a dict with `specs`, `expand`, or `template`.")
 
 
 def materialize_sweep_runs(payload: dict[str, Any]) -> list[SweepRun]:
     base = payload.get("base_spec", {})
     explicit_specs = payload.get("specs", [])
     expanded_specs = _expand_sweep_specs(payload.get("expand", {}))
-    specs = explicit_specs + expanded_specs
+    template_cfg = payload.get("template")
+    template_specs: list[dict[str, Any]] = []
+    if template_cfg:
+        templates = template_cfg if isinstance(template_cfg, list) else [template_cfg]
+        for template in templates:
+            template_specs.extend(_template_sweep_specs(str(template), base))
+    specs = explicit_specs + expanded_specs + template_specs
     if not specs:
         raise ValueError("Sweep config produced no specifications.")
 
@@ -1671,6 +1707,7 @@ def build_models_table(runs: list[SweepRun], table_options: dict[str, Any] | Non
     drop_terms = set(table_options.get("drop_terms", []))
     preferred_order = table_options.get("row_order", [])
     stats_rows = table_options.get("stats_rows", ["N", "R2"])
+    model_labels = table_options.get("model_labels", {})
 
     row_order: list[str] = []
     seen_labels: set[str] = set()
@@ -1710,11 +1747,17 @@ def build_models_table(runs: list[SweepRun], table_options: dict[str, Any] | Non
                 column.append(lookup.get(key, {}).get("se_display", ""))
             else:
                 column.append(lookup.get(row, {}).get("coef_display", ""))
-        table[run.name] = column
+        table[model_labels.get(run.name, run.name)] = column
     return table
 
 
-def dataframe_to_latex(table: pd.DataFrame, group_headers: list[dict[str, Any]] | None = None, notes: list[str] | None = None) -> str:
+def dataframe_to_latex(
+    table: pd.DataFrame,
+    group_headers: list[dict[str, Any]] | None = None,
+    notes: list[str] | None = None,
+    title: str | None = None,
+    depvar_label: str | None = None,
+) -> str:
     def fmt(value: Any) -> str:
         if pd.isna(value):
             return ""
@@ -1724,7 +1767,13 @@ def dataframe_to_latex(table: pd.DataFrame, group_headers: list[dict[str, Any]] 
     header = " & ".join(fmt(col) for col in cols) + r" \\"
     rows = [" & ".join(fmt(row[col]) for col in cols) + r" \\" for _, row in table.iterrows()]
     alignment = "l" * len(cols)
-    lines = [rf"\begin{{tabular}}{{{alignment}}}", r"\hline"]
+    lines = []
+    if title:
+        lines.extend([r"\begin{table}[!htbp]", r"\centering", rf"\caption{{{fmt(title)}}}"])
+    lines.extend([rf"\begin{{tabular}}{{{alignment}}}", r"\hline"])
+    if depvar_label:
+        lines.append(rf"\multicolumn{{{len(cols)}}}{{c}}{{Dependent variable: {fmt(depvar_label)}}} \\")
+        lines.append(r"\hline")
 
     if group_headers:
         model_cols = cols[1:]
@@ -1732,6 +1781,8 @@ def dataframe_to_latex(table: pd.DataFrame, group_headers: list[dict[str, Any]] 
         used = 0
         for group in group_headers:
             models = [model for model in group.get("models", []) if model in model_cols]
+            if not models and len(group_headers) == 1:
+                models = model_cols
             if not models:
                 continue
             header_cells.append(rf"\multicolumn{{{len(models)}}}{{c}}{{{fmt(group['label'])}}}")
@@ -1747,6 +1798,8 @@ def dataframe_to_latex(table: pd.DataFrame, group_headers: list[dict[str, Any]] 
         for note in notes:
             lines.append(fmt(note) + r"\\")
         lines.append(r"\end{flushleft}")
+    if title:
+        lines.append(r"\end{table}")
     return "\n".join(lines)
 
 
@@ -1754,12 +1807,26 @@ def export_models_table(runs: list[SweepRun], output_path: str, table_options: d
     table_options = table_options or {}
     table = build_models_table(runs, table_options=table_options)
     path = Path(output_path)
+    model_labels = table_options.get("model_labels", {})
+    group_headers = table_options.get("group_headers")
+    if group_headers:
+        mapped_headers = []
+        for group in group_headers:
+            mapped_headers.append(
+                {
+                    **group,
+                    "models": [model_labels.get(model, model) for model in group.get("models", [])],
+                }
+            )
+        group_headers = mapped_headers
     if path.suffix.lower() in {".tex", ".latex"}:
         path.write_text(
             dataframe_to_latex(
                 table,
-                group_headers=table_options.get("group_headers"),
+                group_headers=group_headers,
                 notes=table_options.get("notes"),
+                title=table_options.get("title"),
+                depvar_label=table_options.get("depvar_label"),
             ),
             encoding="utf-8",
         )
@@ -1778,23 +1845,28 @@ def build_results_paragraph(runs: list[SweepRun]) -> str:
     leading = runs[0]
     lead_main = leading.summary["main_result"]
     lead_model = leading.summary["selected_model"]
+    spread = max(effects) - min(effects)
+    significance_phrase = (
+        "all specifications remain statistically informative at the 10% level"
+        if significant == len(runs)
+        else f"{significant} of {len(runs)} specifications are statistically informative at the 10% level"
+    )
+    range_phrase = (
+        f"the point estimate is effectively unchanged at {effects[0]:.3f}"
+        if spread < 1e-3
+        else f"the point estimates range from {min(effects):.3f} to {max(effects):.3f}"
+    )
     paragraph = [
         "# Results Paragraph",
         "",
         (
             f"Across {len(runs)} reported specifications, the estimated effect is "
-            f"{'consistently ' + directions[0] if len(set(directions)) == 1 else 'mixed in sign'}."
-        ),
-        (
-            f"Point estimates are identical at {effects[0]:.3f}, and {significant}/{len(runs)} specifications are statistically informative at the 10% level."
-            if max(effects) - min(effects) < 1e-9
-            else f"Point estimates range from {min(effects):.3f} to {max(effects):.3f}, and {significant}/{len(runs)} specifications are statistically informative at the 10% level."
-        ),
-        (
+            f"{'consistently ' + directions[0] if len(set(directions)) == 1 else 'mixed in sign'}. "
+            f"More specifically, {range_phrase}, and {significance_phrase}. "
             f"In the leading specification ({leading.name}, {lead_model}), the reported estimate is "
-            f"{lead_main['coefficient']:.3f} with standard error {lead_main['std_error']:.3f}."
+            f"{lead_main['coefficient']:.3f} with standard error {lead_main['std_error']:.3f}. "
+            f"{consistency}"
         ),
-        consistency,
     ]
     return "\n".join(paragraph) + "\n"
 
