@@ -125,11 +125,13 @@ class LiteEconometricsAgent:
         suffix = path.suffix.lower()
         if suffix == ".csv":
             return pd.read_csv(path)
+        if suffix == ".dta":
+            return pd.read_stata(path, convert_categoricals=False)
         if suffix == ".parquet":
             return pd.read_parquet(path)
         if suffix in {".xlsx", ".xls"}:
             return pd.read_excel(path)
-        raise ValueError(f"Unsupported data format: {suffix}. Use csv, parquet, or xlsx.")
+        raise ValueError(f"Unsupported data format: {suffix}. Use csv, dta, parquet, or xlsx.")
 
     def _prepare_data(self, df: pd.DataFrame, model: str) -> pd.DataFrame:
         frame = df.copy()

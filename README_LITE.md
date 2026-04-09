@@ -85,7 +85,7 @@ python lite_econometrics_agent.py demo
 
 ## 当前边界
 
-- 默认只支持 `csv / parquet / xlsx`
+- 默认支持 `csv / dta / parquet / xlsx`
 - FE 版本要求同时提供 `entity-id` 和 `time-id`
 - IV 版本当前只支持单个工具变量
 - reflection 是规则型，不是开放式 LLM 自修复
