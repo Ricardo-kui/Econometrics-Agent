@@ -100,8 +100,10 @@ class RulePlanner:
     DID_KEYWORDS = {"did", "difference in difference", "difference-in-differences", "policy shock", "treated", "staggered adoption"}
     EVENT_STUDY_KEYWORDS = {"event study", "dynamic effect", "dynamic treatment", "lead", "lag", "pretrend", "pre-trend"}
     RDD_KEYWORDS = {"rdd", "regression discontinuity", "discontinuity", "cutoff", "threshold"}
+    FUZZY_RDD_KEYWORDS = {"fuzzy rdd", "fuzzy regression discontinuity", "fuzzy discontinuity"}
     PSM_KEYWORDS = {"psm", "matching", "matched", "propensity score"}
     IPW_KEYWORDS = {"ipw", "inverse probability weighting", "propensity weighting"}
+    AIPW_KEYWORDS = {"aipw", "augmented ipw", "double robust", "doubly robust", "augmented inverse probability weighting"}
 
     @classmethod
     def has_panel_structure(cls, spec: AnalysisSpec, df: pd.DataFrame) -> bool:
@@ -121,8 +123,10 @@ class RulePlanner:
         did_requested = any(keyword in query for keyword in cls.DID_KEYWORDS)
         event_requested = any(keyword in query for keyword in cls.EVENT_STUDY_KEYWORDS)
         rdd_requested = any(keyword in query for keyword in cls.RDD_KEYWORDS)
+        fuzzy_rdd_requested = any(keyword in query for keyword in cls.FUZZY_RDD_KEYWORDS)
         psm_requested = any(keyword in query for keyword in cls.PSM_KEYWORDS)
         ipw_requested = any(keyword in query for keyword in cls.IPW_KEYWORDS)
+        aipw_requested = any(keyword in query for keyword in cls.AIPW_KEYWORDS)
 
         if spec.model != "auto":
             return spec.model, [f"user_forced_model={spec.model}"]
@@ -135,13 +139,25 @@ class RulePlanner:
             reasons.append("query mentions IV / endogenous treatment")
             return "iv", reasons
 
+        if spec.running_variable and spec.cutoff is not None and fuzzy_rdd_requested:
+            reasons.append("running variable and cutoff were provided explicitly for a fuzzy RDD task")
+            return "fuzzy-rdd", reasons
+
         if spec.running_variable and spec.cutoff is not None:
             reasons.append("running variable and cutoff were provided explicitly")
             return "rdd", reasons
 
+        if fuzzy_rdd_requested and spec.running_variable:
+            reasons.append("query explicitly requests fuzzy RDD and a running variable is available")
+            return "fuzzy-rdd", reasons
+
         if rdd_requested and spec.running_variable:
             reasons.append("query mentions a discontinuity design and a running variable is available")
             return "rdd", reasons
+
+        if aipw_requested and spec.treatment in df.columns and is_binary_like(df[spec.treatment]):
+            reasons.append("query explicitly requests a doubly robust AIPW estimator")
+            return "aipw", reasons
 
         if ipw_requested and spec.treatment in df.columns and is_binary_like(df[spec.treatment]):
             reasons.append("query explicitly requests inverse-probability weighting")
@@ -415,11 +431,12 @@ class EconometricTools:
         )
         result = make_scalar_result(term=term_name, estimate=estimate, std_error=std_error)
         overlap = EconometricTools._overlap_summary(df[spec.treatment], propensity)
+        balance = EconometricTools._balance_diagnostics(df, spec, after_weights=EconometricTools._matching_weights(df, propensity, spec))
         return FitBundle(
             result=result,
             main_term=term_name,
             model_label="psm",
-            extras={"propensity_range": overlap, "priority_terms": [term_name]},
+            extras={"propensity_range": overlap, "balance_summary": balance, "priority_terms": [term_name]},
         )
 
     @staticmethod
@@ -438,11 +455,42 @@ class EconometricTools:
         )
         result = make_scalar_result(term=term_name, estimate=estimate, std_error=std_error)
         overlap = EconometricTools._overlap_summary(df[spec.treatment], propensity)
+        balance = EconometricTools._balance_diagnostics(df, spec, after_weights=weight_summary["weights"])
         return FitBundle(
             result=result,
             main_term=term_name,
             model_label="ipw",
-            extras={"propensity_range": overlap, "weight_summary": weight_summary, "priority_terms": [term_name]},
+            extras={"propensity_range": overlap, "weight_summary": weight_summary, "balance_summary": balance, "priority_terms": [term_name]},
+        )
+
+    @staticmethod
+    def fit_aipw(df: pd.DataFrame, spec: AnalysisSpec) -> FitBundle:
+        if spec.estimand.upper() != "ATE":
+            raise ValueError("AIPW currently supports ATE only.")
+        propensity, _ = EconometricTools._estimate_propensity(df, spec)
+        estimate, details = EconometricTools._aipw_estimate(df, propensity, spec)
+        std_error = EconometricTools._bootstrap_scalar_estimate(
+            df,
+            spec,
+            lambda boot_df: EconometricTools._aipw_estimate(
+                boot_df,
+                EconometricTools._estimate_propensity(boot_df, spec)[0],
+                spec,
+            )[0],
+        )
+        result = make_scalar_result(term="ate_aipw", estimate=estimate, std_error=std_error)
+        overlap = EconometricTools._overlap_summary(df[spec.treatment], propensity)
+        balance = EconometricTools._balance_diagnostics(df, spec, after_weights=details["ipw_weights"])
+        return FitBundle(
+            result=result,
+            main_term="ate_aipw",
+            model_label="aipw",
+            extras={
+                "propensity_range": overlap,
+                "weight_summary": details["weight_summary"],
+                "balance_summary": balance,
+                "priority_terms": ["ate_aipw"],
+            },
         )
 
     @staticmethod
@@ -452,19 +500,7 @@ class EconometricTools:
         if not is_binary_like(df[spec.treatment]):
             raise ValueError("Sharp RDD requires a binary treatment indicator.")
 
-        selected = df.copy()
-        running = selected[spec.running_variable].astype(float)
-        if spec.bandwidth is None:
-            bandwidth = max(running.max() - spec.cutoff, spec.cutoff - running.min())
-        else:
-            bandwidth = float(spec.bandwidth)
-        if bandwidth <= 0:
-            raise ValueError("RDD bandwidth must be positive.")
-        selected = selected[(running >= spec.cutoff - bandwidth) & (running <= spec.cutoff + bandwidth)].copy()
-        if selected.empty:
-            raise ValueError("RDD bandwidth leaves no usable observations.")
-        if (selected[spec.running_variable] >= spec.cutoff).sum() == 0 or (selected[spec.running_variable] < spec.cutoff).sum() == 0:
-            raise ValueError("RDD requires support on both sides of the cutoff.")
+        selected, bandwidth = EconometricTools._select_rdd_sample(df, spec)
 
         centered = (selected[spec.running_variable] - spec.cutoff).rename("running_centered")
         interaction = (centered * selected[spec.treatment]).rename("running_interaction")
@@ -481,6 +517,40 @@ class EconometricTools:
             result=result,
             main_term=spec.treatment,
             model_label="rdd",
+            extras={
+                "bandwidth_used": bandwidth,
+                "n_left": int((selected[spec.running_variable] < spec.cutoff).sum()),
+                "n_right": int((selected[spec.running_variable] >= spec.cutoff).sum()),
+                "priority_terms": [spec.treatment],
+            },
+        )
+
+    @staticmethod
+    def fit_fuzzy_rdd(df: pd.DataFrame, spec: AnalysisSpec) -> FitBundle:
+        if spec.running_variable is None or spec.cutoff is None:
+            raise ValueError("Fuzzy RDD requires --running-variable and --cutoff.")
+
+        selected, bandwidth = EconometricTools._select_rdd_sample(df, spec)
+        running = selected[spec.running_variable].astype(float)
+        assignment = (running >= spec.cutoff).astype(float).rename("cutoff_assignment")
+        centered = (running - spec.cutoff).rename("running_centered")
+        interaction = (centered * assignment).rename("running_interaction")
+        weights = EconometricTools._kernel_weights(centered, bandwidth, spec.kernel)
+        if spec.weights:
+            weights = weights * selected[spec.weights].astype(float)
+
+        y = selected[spec.outcome]
+        exog = pd.DataFrame({"const": 1.0, "running_centered": centered, "running_interaction": interaction}, index=selected.index)
+        for col in spec.controls:
+            exog[col] = selected[col]
+        endog = selected[spec.treatment].astype(float)
+        instruments = pd.DataFrame({"cutoff_assignment": assignment}, index=selected.index)
+        fit_kwargs = {"cov_type": "clustered", "clusters": selected[spec.cluster]} if spec.cluster else {"cov_type": "robust"}
+        result = IV2SLS(y, exog, endog, instruments, weights=weights).fit(**fit_kwargs)
+        return FitBundle(
+            result=result,
+            main_term=spec.treatment,
+            model_label="fuzzy-rdd",
             extras={
                 "bandwidth_used": bandwidth,
                 "n_left": int((selected[spec.running_variable] < spec.cutoff).sum()),
@@ -530,6 +600,29 @@ class EconometricTools:
         )
 
     @staticmethod
+    def _matching_weights(df: pd.DataFrame, propensity: pd.Series, spec: AnalysisSpec) -> pd.Series:
+        treated = df[spec.treatment].astype(int)
+        k = max(int(spec.matched_num), 1)
+        weights = pd.Series(0.0, index=df.index)
+        treat_index = treated[treated == 1].index
+        control_index = treated[treated == 0].index
+        if spec.estimand.upper() == "ATT":
+            weights.loc[treat_index] = 1.0
+            for idx in treat_index:
+                neighbors = (propensity.loc[control_index] - propensity.loc[idx]).abs().sort_values().head(k).index
+                weights.loc[neighbors] += 1.0 / k
+            return weights
+
+        weights.loc[:] = 1.0
+        for idx in treat_index:
+            neighbors = (propensity.loc[control_index] - propensity.loc[idx]).abs().sort_values().head(k).index
+            weights.loc[neighbors] += 1.0 / k
+        for idx in control_index:
+            neighbors = (propensity.loc[treat_index] - propensity.loc[idx]).abs().sort_values().head(k).index
+            weights.loc[neighbors] += 1.0 / k
+        return weights
+
+    @staticmethod
     def _ipw_estimate(df: pd.DataFrame, propensity: pd.Series, spec: AnalysisSpec) -> tuple[float, dict[str, float]]:
         treated = df[spec.treatment].astype(float)
         outcome = df[spec.outcome].astype(float)
@@ -550,8 +643,88 @@ class EconometricTools:
             "weight_min": float(final_weights.min()),
             "weight_p95": float(final_weights.quantile(0.95)),
             "weight_max": float(final_weights.max()),
+            "weights": final_weights,
         }
         return estimate, summary
+
+    @staticmethod
+    def _aipw_estimate(df: pd.DataFrame, propensity: pd.Series, spec: AnalysisSpec) -> tuple[float, dict[str, Any]]:
+        treated = df[spec.treatment].astype(float)
+        outcome = df[spec.outcome].astype(float)
+        sample_weights = df[spec.weights].astype(float) if spec.weights else pd.Series(1.0, index=df.index)
+
+        X = sm.add_constant(df[spec.controls], has_constant="add")
+        treated_mask = treated == 1
+        control_mask = treated == 0
+        if treated_mask.sum() == 0 or control_mask.sum() == 0:
+            raise ValueError("AIPW requires both treated and control observations.")
+
+        model_treated = sm.WLS(outcome.loc[treated_mask], X.loc[treated_mask], weights=sample_weights.loc[treated_mask]).fit()
+        model_control = sm.WLS(outcome.loc[control_mask], X.loc[control_mask], weights=sample_weights.loc[control_mask]).fit()
+        mu1 = pd.Series(model_treated.predict(X), index=df.index)
+        mu0 = pd.Series(model_control.predict(X), index=df.index)
+
+        influence = mu1 - mu0 + treated * (outcome - mu1) / propensity - (1 - treated) * (outcome - mu0) / (1 - propensity)
+        estimate = float((sample_weights * influence).sum() / sample_weights.sum())
+        ipw_weights = sample_weights * (treated / propensity + (1 - treated) / (1 - propensity))
+        details = {
+            "ipw_weights": ipw_weights,
+            "weight_summary": {
+                "weight_min": float(ipw_weights.min()),
+                "weight_p95": float(ipw_weights.quantile(0.95)),
+                "weight_max": float(ipw_weights.max()),
+            },
+        }
+        return estimate, details
+
+    @staticmethod
+    def _select_rdd_sample(df: pd.DataFrame, spec: AnalysisSpec) -> tuple[pd.DataFrame, float]:
+        selected = df.copy()
+        running = selected[spec.running_variable].astype(float)
+        bandwidth = max(running.max() - spec.cutoff, spec.cutoff - running.min()) if spec.bandwidth is None else float(spec.bandwidth)
+        if bandwidth <= 0:
+            raise ValueError("RDD bandwidth must be positive.")
+        selected = selected[(running >= spec.cutoff - bandwidth) & (running <= spec.cutoff + bandwidth)].copy()
+        if selected.empty:
+            raise ValueError("RDD bandwidth leaves no usable observations.")
+        if (selected[spec.running_variable] >= spec.cutoff).sum() == 0 or (selected[spec.running_variable] < spec.cutoff).sum() == 0:
+            raise ValueError("RDD requires support on both sides of the cutoff.")
+        return selected, bandwidth
+
+    @staticmethod
+    def _balance_diagnostics(df: pd.DataFrame, spec: AnalysisSpec, after_weights: pd.Series | None = None) -> dict[str, Any]:
+        treated = df[spec.treatment].astype(int)
+        before: dict[str, float] = {}
+        after: dict[str, float] = {}
+        control_mask = treated == 0
+        treat_mask = treated == 1
+        if not spec.controls:
+            return {"before": before, "after": after, "max_abs_before": np.nan, "max_abs_after": np.nan}
+
+        for col in spec.controls:
+            x = df[col].astype(float)
+            mean_t = x.loc[treat_mask].mean()
+            mean_c = x.loc[control_mask].mean()
+            pooled_sd = np.sqrt((x.loc[treat_mask].var(ddof=1) + x.loc[control_mask].var(ddof=1)) / 2)
+            before[col] = 0.0 if pooled_sd == 0 or np.isnan(pooled_sd) else float((mean_t - mean_c) / pooled_sd)
+            if after_weights is not None:
+                wt = after_weights.loc[treat_mask]
+                wc = after_weights.loc[control_mask]
+                mean_t_w = np.average(x.loc[treat_mask], weights=wt)
+                mean_c_w = np.average(x.loc[control_mask], weights=wc)
+                var_t_w = np.average((x.loc[treat_mask] - mean_t_w) ** 2, weights=wt)
+                var_c_w = np.average((x.loc[control_mask] - mean_c_w) ** 2, weights=wc)
+                pooled_sd_w = np.sqrt((var_t_w + var_c_w) / 2)
+                after[col] = 0.0 if pooled_sd_w == 0 or np.isnan(pooled_sd_w) else float((mean_t_w - mean_c_w) / pooled_sd_w)
+
+        max_before = max(abs(v) for v in before.values()) if before else np.nan
+        max_after = max(abs(v) for v in after.values()) if after else np.nan
+        return {
+            "before": before,
+            "after": after,
+            "max_abs_before": max_before,
+            "max_abs_after": max_after,
+        }
 
     @staticmethod
     def _bootstrap_scalar_estimate(df: pd.DataFrame, spec: AnalysisSpec, estimator, reps: int = 30) -> float:
@@ -589,7 +762,7 @@ class EconometricTools:
             weights = 1 - scaled
         else:
             weights = 0.75 * (1 - scaled.pow(2))
-        return weights.clip(lower=0)
+        return weights.clip(lower=1e-8)
 
 
 class LiteEconometricsAgent:
@@ -636,13 +809,18 @@ class LiteEconometricsAgent:
         query = (self.spec.query or "").lower()
         did_like = any(keyword in query for keyword in RulePlanner.DID_KEYWORDS)
         rdd_like = any(keyword in query for keyword in RulePlanner.RDD_KEYWORDS)
+        fuzzy_rdd_like = any(keyword in query for keyword in RulePlanner.FUZZY_RDD_KEYWORDS)
         if did_like and model not in {"did", "event-study"}:
             self.reflection_log.append(
                 "query mentions a DID-style design, but available variables were insufficient for DID routing; review treat_group/post or panel treatment timing"
             )
-        if rdd_like and model != "rdd":
+        if rdd_like and model not in {"rdd", "fuzzy-rdd"}:
             self.reflection_log.append(
                 "query mentions a discontinuity design, but running-variable / cutoff inputs were insufficient for RDD routing"
+            )
+        if fuzzy_rdd_like and model != "fuzzy-rdd":
+            self.reflection_log.append(
+                "query mentions fuzzy RDD, but the available discontinuity inputs did not trigger fuzzy-RDD routing"
             )
         if model == "event-study" and RulePlanner.has_panel_structure(self.spec, df):
             self.reflection_log.append("event-study was selected because the task asks for dynamic treatment effects in panel data")
@@ -717,10 +895,10 @@ class LiteEconometricsAgent:
         if model in {"fe", "did", "event-study"} and self.spec.entity_id and self.spec.time_id:
             frame = frame.sort_values([self.spec.entity_id, self.spec.time_id]).copy()
 
-        if model in {"psm", "ipw"} and not self.spec.controls:
-            raise ValueError("PSM/IPW require at least one control variable for the propensity model.")
+        if model in {"psm", "ipw", "aipw"} and not self.spec.controls:
+            raise ValueError("PSM/IPW/AIPW require at least one control variable for the propensity model.")
 
-        if model == "rdd":
+        if model in {"rdd", "fuzzy-rdd"}:
             if self.spec.running_variable is None or self.spec.cutoff is None:
                 raise ValueError("RDD requires --running-variable and --cutoff.")
             self.spec.kernel = self.spec.kernel.lower()
@@ -737,8 +915,10 @@ class LiteEconometricsAgent:
             "did": EconometricTools.fit_did,
             "event-study": EconometricTools.fit_event_study,
             "rdd": EconometricTools.fit_rdd,
+            "fuzzy-rdd": EconometricTools.fit_fuzzy_rdd,
             "psm": EconometricTools.fit_psm,
             "ipw": EconometricTools.fit_ipw,
+            "aipw": EconometricTools.fit_aipw,
         }
         try:
             bundle = tools[model](df, self.spec)
@@ -815,23 +995,45 @@ class LiteEconometricsAgent:
             if post_terms:
                 diagnostics.append(f"available dynamic post-treatment coefficients: {', '.join(post_terms)}")
 
-        if model in {"psm", "ipw"}:
+        if model in {"psm", "ipw", "aipw"}:
             overlap = bundle.extras.get("propensity_range", {})
             if overlap:
                 diagnostics.append(
                     "propensity support: treated [{treated_min:.3f}, {treated_max:.3f}], control [{control_min:.3f}, {control_max:.3f}]".format(**overlap)
                 )
-            if model == "ipw":
+            balance = bundle.extras.get("balance_summary", {})
+            if balance:
+                diagnostics.append(
+                    f"max abs standardized mean difference: before={balance.get('max_abs_before'):.3f}, after={balance.get('max_abs_after'):.3f}"
+                )
+            if model in {"ipw", "aipw"}:
                 weight_summary = bundle.extras.get("weight_summary", {})
                 if weight_summary:
                     diagnostics.append(
                         "IPW weight summary: min={weight_min:.3f}, p95={weight_p95:.3f}, max={weight_max:.3f}".format(**weight_summary)
                     )
+            if model == "aipw":
+                diagnostics.append("AIPW is doubly robust, not assumption-free; it still relies on overlap and one of the nuisance models being correctly specified")
 
         if model == "rdd":
             diagnostics.append(
                 f"RDD support near cutoff: left={bundle.extras.get('n_left', 0)}, right={bundle.extras.get('n_right', 0)}, bandwidth={bundle.extras.get('bandwidth_used')}"
             )
+
+        if model == "fuzzy-rdd":
+            diagnostics.append(
+                f"Fuzzy RDD support near cutoff: left={bundle.extras.get('n_left', 0)}, right={bundle.extras.get('n_right', 0)}, bandwidth={bundle.extras.get('bandwidth_used')}"
+            )
+            if hasattr(result, "first_stage"):
+                try:
+                    first_stage = result.first_stage.diagnostics
+                    if not first_stage.empty:
+                        first_row = first_stage.iloc[0].to_dict()
+                        f_stat = first_row.get("f.stat") or first_row.get("f")
+                        if f_stat is not None:
+                            diagnostics.append(f"cutoff first-stage F statistic: {float(f_stat):.2f}")
+                except Exception as exc:
+                    diagnostics.append(f"could not parse fuzzy-RDD first-stage diagnostics: {exc}")
 
         return diagnostics
 
@@ -982,8 +1184,11 @@ def make_demo_data(output_dir: Path) -> dict[str, Path]:
 
     running = rng.uniform(-2, 2, size=n)
     treat_rdd = (running >= 0).astype(int)
+    fuzzy_prob = np.where(running >= 0, 0.8, 0.2)
+    treat_fuzzy = (rng.random(size=n) < fuzzy_prob).astype(int)
     y_rdd = 2.2 * treat_rdd + 0.8 * running - 0.3 * running * treat_rdd + rng.normal(scale=0.7, size=n)
-    rdd_df = pd.DataFrame({"y": y_rdd, "treat": treat_rdd, "score": running, "x": rng.normal(size=n)})
+    y_fuzzy = 1.9 * treat_fuzzy + 0.7 * running - 0.2 * running * (running >= 0).astype(int) + rng.normal(scale=0.8, size=n)
+    rdd_df = pd.DataFrame({"y": y_rdd, "treat": treat_rdd, "y_fuzzy": y_fuzzy, "treat_fuzzy": treat_fuzzy, "score": running, "x": rng.normal(size=n)})
     rdd_path = output_dir / "rdd_demo.csv"
     rdd_df.to_csv(rdd_path, index=False)
 
@@ -1059,6 +1264,14 @@ def run_demo(output_dir: str) -> None:
             model="auto",
         ),
         AnalysisSpec(
+            data=str(paths["psm"]),
+            query="estimate the treatment effect with doubly robust augmented IPW",
+            outcome="y",
+            treatment="treat",
+            controls=["x1", "x2"],
+            model="auto",
+        ),
+        AnalysisSpec(
             data=str(paths["rdd"]),
             query="run a sharp RDD around the score cutoff",
             outcome="y",
@@ -1067,6 +1280,16 @@ def run_demo(output_dir: str) -> None:
             running_variable="score",
             cutoff=0.0,
             model="auto",
+        ),
+        AnalysisSpec(
+            data=str(paths["rdd"]),
+            query="run a fuzzy RDD around the score cutoff",
+            outcome="y_fuzzy",
+            treatment="treat_fuzzy",
+            controls=["x"],
+            running_variable="score",
+            cutoff=0.0,
+            model="fuzzy-rdd",
         ),
         AnalysisSpec(
             data=str(paths["iv"]),
@@ -1105,16 +1328,16 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--kernel", choices=["uniform", "triangle", "epanechnikov"], default="triangle")
     run_parser.add_argument("--estimand", choices=["ATE", "ATT"], default="ATE")
     run_parser.add_argument("--matched-num", type=int, default=1)
-    run_parser.add_argument("--model", choices=["auto", "ols", "fe", "iv", "did", "event-study", "psm", "ipw", "rdd"], default="auto")
+    run_parser.add_argument("--model", choices=["auto", "ols", "fe", "iv", "did", "event-study", "psm", "ipw", "aipw", "rdd", "fuzzy-rdd"], default="auto")
     run_parser.add_argument("--lead-window", type=int, default=4)
     run_parser.add_argument("--lag-window", type=int, default=3)
     run_parser.add_argument("--save-summary")
 
-    demo_parser = subparsers.add_parser("demo", help="Generate demo data and run OLS/FE/DID/Event-Study/PSM/IPW/RDD/IV examples.")
+    demo_parser = subparsers.add_parser("demo", help="Generate demo data and run OLS/FE/DID/Event-Study/PSM/IPW/AIPW/RDD/Fuzzy-RDD/IV examples.")
     demo_parser.add_argument("--output-dir", default="lite_demo_output")
 
     knowledge_parser = subparsers.add_parser("knowledge", help="Print the absorbed econometric knowledge cards.")
-    knowledge_parser.add_argument("--model", choices=["all", "ols", "fe", "iv", "did", "event-study", "psm", "ipw", "rdd"], default="all")
+    knowledge_parser.add_argument("--model", choices=["all", "ols", "fe", "iv", "did", "event-study", "psm", "ipw", "aipw", "rdd", "fuzzy-rdd"], default="all")
 
     return parser
 

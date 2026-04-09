@@ -7,7 +7,7 @@
 ## 原项目中保留了什么
 
 - 任务分解：把问题拆成数据校验、模型选择、估计、反思四步
-- 模型选择：根据用户请求和数据结构，在 `OLS / FE / IV / DID / Event Study / PSM / IPW / RDD` 间做规则驱动选择
+- 模型选择：根据用户请求和数据结构，在 `OLS / FE / IV / DID / Event Study / PSM / IPW / AIPW / Sharp RDD / Fuzzy RDD` 间做规则驱动选择
 - 工具思想：不让 LLM 自由发挥“发明方法”，而是显式调用本地计量函数
 - reflection：对报错、缺失、常数列、弱工具变量和估计精度做基础反思
 - 方法知识卡：把原项目里分散在 tool docstring 和 prompt guidance 里的识别逻辑，压成结构化知识库
@@ -45,7 +45,9 @@
 - `propensity_score_construction`
 - `propensity_score_matching`
 - `propensity_score_inverse_probability_weighting`
+- `propensity_score_double_robust_estimator_augmented_IPW`
 - `Sharp_Regression_Discontinuity_Design_regression`
+- `Fuzzy_Regression_Discontinuity_Design_regression`
 
 ## 用法
 
@@ -161,7 +163,34 @@ python lite_econometrics_agent.py run \
   --model rdd
 ```
 
-### 10. 一键演示 OLS / FE / DID / Event Study / PSM / IPW / RDD / IV
+### 10. 跑一个 AIPW
+
+```bash
+python lite_econometrics_agent.py run \
+  --data selection_sample.csv \
+  --query "estimate the treatment effect with doubly robust augmented IPW" \
+  --outcome y \
+  --treatment treat \
+  --controls x1 x2 \
+  --model aipw
+```
+
+### 11. 跑一个 Fuzzy RDD
+
+```bash
+python lite_econometrics_agent.py run \
+  --data cutoff_sample.csv \
+  --query "run a fuzzy RDD around the score cutoff" \
+  --outcome y \
+  --treatment treat \
+  --controls x1 \
+  --running-variable score \
+  --cutoff 0 \
+  --kernel triangle \
+  --model fuzzy-rdd
+```
+
+### 12. 一键演示 OLS / FE / DID / Event Study / PSM / IPW / AIPW / Sharp RDD / Fuzzy RDD / IV
 
 ```bash
 python lite_econometrics_agent.py demo
@@ -174,6 +203,7 @@ python lite_econometrics_agent.py demo
 - 输出里会给出 `knowledge_card`，包括适用场景、识别逻辑、诊断项和常见失败模式
 - 反思日志会记录自动清洗、丢弃行、删除常数列、弱工具变量提示等
 - 支持 `weights` 和 `cluster` 作为显式输入，而不是藏在内部假设里
+- 对 `PSM / IPW / AIPW` 会输出 balance 改善前后的 standardized mean difference 摘要
 - 所有结果都以结构化 JSON + 系数表打印
 
 ## 当前边界
@@ -182,6 +212,7 @@ python lite_econometrics_agent.py demo
 - FE、Staggered DID、Event Study 要求同时提供 `entity-id` 和 `time-id`
 - IV 版本当前只支持单个工具变量
 - Event Study 当前假设处理状态是单调开启的二元变量
-- 当前 RDD 只实现了 sharp local-linear 版本，还没有接 fuzzy RDD
+- 当前 RDD 层已经支持 `sharp` 和 `fuzzy` local-linear 版本，但还没有接 global polynomial 版本
 - PSM / IPW 当前面向二元处理变量，且默认依赖“selection on observables”
+- AIPW 当前支持 `ATE`，还没有扩到 `ATT`
 - reflection 是规则型，不是开放式 LLM 自修复
