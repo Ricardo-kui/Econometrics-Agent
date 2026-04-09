@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from dataclasses import dataclass, field, replace
+from itertools import product
 from pathlib import Path
 from typing import Any
 import difflib
@@ -1606,16 +1607,55 @@ def build_spec_from_dict(data: dict[str, Any]) -> AnalysisSpec:
     )
 
 
-def load_sweep_config(config_path: str) -> list[SweepRun]:
+def _normalize_expand_entry(entry: Any) -> tuple[Any, str]:
+    if isinstance(entry, dict) and "value" in entry:
+        value = entry["value"]
+        label = str(entry.get("label", value))
+        return value, label
+    return entry, str(entry)
+
+
+def _expand_sweep_specs(expand_cfg: dict[str, list[Any]]) -> list[dict[str, Any]]:
+    if not expand_cfg:
+        return []
+    items = list(expand_cfg.items())
+    value_lists = []
+    for _, values in items:
+        if not isinstance(values, list) or not values:
+            raise ValueError("Each `expand` field must be a non-empty list.")
+        value_lists.append([_normalize_expand_entry(v) for v in values])
+
+    specs: list[dict[str, Any]] = []
+    for combo in product(*value_lists):
+        spec: dict[str, Any] = {}
+        labels: list[str] = []
+        for (field_name, _), (value, label) in zip(items, combo):
+            spec[field_name] = value
+            labels.append(f"{field_name}={label}")
+        spec["name"] = "__".join(labels)
+        specs.append(spec)
+    return specs
+
+
+def load_sweep_config(config_path: str) -> dict[str, Any]:
     payload = json.loads(Path(config_path).read_text(encoding="utf-8"))
     if isinstance(payload, dict) and "specs" in payload:
-        base = payload.get("base_spec", {})
-        specs = payload["specs"]
+        return payload
+    elif isinstance(payload, dict) and "expand" in payload:
+        return payload
     elif isinstance(payload, list):
-        base = {}
-        specs = payload
+        return {"base_spec": {}, "specs": payload}
     else:
         raise ValueError("Sweep config must be a list of specs or a dict with `specs`.")
+
+
+def materialize_sweep_runs(payload: dict[str, Any]) -> list[SweepRun]:
+    base = payload.get("base_spec", {})
+    explicit_specs = payload.get("specs", [])
+    expanded_specs = _expand_sweep_specs(payload.get("expand", {}))
+    specs = explicit_specs + expanded_specs
+    if not specs:
+        raise ValueError("Sweep config produced no specifications.")
 
     runs: list[SweepRun] = []
     for idx, spec_cfg in enumerate(specs, start=1):
@@ -1626,17 +1666,34 @@ def load_sweep_config(config_path: str) -> list[SweepRun]:
     return runs
 
 
-def build_models_table(runs: list[SweepRun]) -> pd.DataFrame:
+def build_models_table(runs: list[SweepRun], table_options: dict[str, Any] | None = None) -> pd.DataFrame:
+    table_options = table_options or {}
+    drop_terms = set(table_options.get("drop_terms", []))
+    preferred_order = table_options.get("row_order", [])
+    stats_rows = table_options.get("stats_rows", ["N", "R2"])
+
     row_order: list[str] = []
-    row_labels: dict[str, str] = {}
+    seen_labels: set[str] = set()
     for run in runs:
         for record in run.summary["terms_table"]:
+            if record["term"] in drop_terms or record["label"] in drop_terms:
+                continue
             label = record["label"]
-            if label not in row_labels:
-                row_labels[label] = label
+            if label not in seen_labels:
+                seen_labels.add(label)
                 row_order.extend([label, f"{label}__se"])
 
-    row_order.extend(["N", "R2"])
+    if preferred_order:
+        ordered_rows = []
+        for label in preferred_order:
+            if label in seen_labels:
+                ordered_rows.extend([label, f"{label}__se"])
+        for label in seen_labels:
+            if label not in preferred_order:
+                ordered_rows.extend([label, f"{label}__se"])
+        row_order = ordered_rows
+
+    row_order.extend(stats_rows)
     table = pd.DataFrame({"row_label": [label.replace("__se", " (SE)") for label in row_order]})
 
     for run in runs:
@@ -1657,34 +1714,55 @@ def build_models_table(runs: list[SweepRun]) -> pd.DataFrame:
     return table
 
 
-def dataframe_to_latex(table: pd.DataFrame) -> str:
+def dataframe_to_latex(table: pd.DataFrame, group_headers: list[dict[str, Any]] | None = None, notes: list[str] | None = None) -> str:
     def fmt(value: Any) -> str:
         if pd.isna(value):
             return ""
         return str(value).replace("_", "\\_")
 
     cols = list(table.columns)
-    header = " & ".join(cols) + r" \\"
+    header = " & ".join(fmt(col) for col in cols) + r" \\"
     rows = [" & ".join(fmt(row[col]) for col in cols) + r" \\" for _, row in table.iterrows()]
     alignment = "l" * len(cols)
-    return "\n".join(
-        [
-            rf"\begin{{tabular}}{{{alignment}}}",
-            r"\hline",
-            header,
-            r"\hline",
-            "\n".join(rows),
-            r"\hline",
-            r"\end{tabular}",
-        ]
-    )
+    lines = [rf"\begin{{tabular}}{{{alignment}}}", r"\hline"]
+
+    if group_headers:
+        model_cols = cols[1:]
+        header_cells = [""]
+        used = 0
+        for group in group_headers:
+            models = [model for model in group.get("models", []) if model in model_cols]
+            if not models:
+                continue
+            header_cells.append(rf"\multicolumn{{{len(models)}}}{{c}}{{{fmt(group['label'])}}}")
+            used += len(models)
+        remaining = len(model_cols) - used
+        if remaining > 0:
+            header_cells.append(rf"\multicolumn{{{remaining}}}{{c}}{{Other}}")
+        lines.append(" & ".join(header_cells) + r" \\")
+
+    lines.extend([header, r"\hline", "\n".join(rows), r"\hline", r"\end{tabular}"])
+    if notes:
+        lines.extend(["", r"\begin{flushleft}", r"\footnotesize"])
+        for note in notes:
+            lines.append(fmt(note) + r"\\")
+        lines.append(r"\end{flushleft}")
+    return "\n".join(lines)
 
 
-def export_models_table(runs: list[SweepRun], output_path: str) -> None:
-    table = build_models_table(runs)
+def export_models_table(runs: list[SweepRun], output_path: str, table_options: dict[str, Any] | None = None) -> None:
+    table_options = table_options or {}
+    table = build_models_table(runs, table_options=table_options)
     path = Path(output_path)
     if path.suffix.lower() in {".tex", ".latex"}:
-        path.write_text(dataframe_to_latex(table), encoding="utf-8")
+        path.write_text(
+            dataframe_to_latex(
+                table,
+                group_headers=table_options.get("group_headers"),
+                notes=table_options.get("notes"),
+            ),
+            encoding="utf-8",
+        )
     else:
         table.to_csv(path, index=False)
 
@@ -1692,23 +1770,30 @@ def export_models_table(runs: list[SweepRun], output_path: str) -> None:
 def build_results_paragraph(runs: list[SweepRun]) -> str:
     if not runs:
         return ""
-    direction_words = []
-    signs = []
-    for run in runs:
-        coef = run.summary["main_result"]["coefficient"]
-        pvalue = run.summary["main_result"]["pvalue"]
-        direction = "positive" if coef > 0 else "negative" if coef < 0 else "near zero"
-        significance = "statistically informative" if pvalue <= 0.1 else "imprecise"
-        signs.append(direction)
-        direction_words.append(
-            f"{run.name}: {run.summary['selected_model']} estimate = {coef:.3f} ({significance}, {direction})"
-        )
-    consistency = "The sign is directionally consistent across specifications." if len(set(signs)) == 1 else "The sign is not fully consistent across specifications."
+    effects = [run.summary["main_result"]["coefficient"] for run in runs]
+    pvalues = [run.summary["main_result"]["pvalue"] for run in runs]
+    significant = sum(p <= 0.1 for p in pvalues)
+    directions = ["positive" if coef > 0 else "negative" if coef < 0 else "near zero" for coef in effects]
+    consistency = "The sign is directionally consistent across specifications." if len(set(directions)) == 1 else "The sign is not fully consistent across specifications."
+    leading = runs[0]
+    lead_main = leading.summary["main_result"]
+    lead_model = leading.summary["selected_model"]
     paragraph = [
         "# Results Paragraph",
         "",
-        "Across the reported specifications, the main effect can be summarized as follows.",
-        "; ".join(direction_words) + ".",
+        (
+            f"Across {len(runs)} reported specifications, the estimated effect is "
+            f"{'consistently ' + directions[0] if len(set(directions)) == 1 else 'mixed in sign'}."
+        ),
+        (
+            f"Point estimates are identical at {effects[0]:.3f}, and {significant}/{len(runs)} specifications are statistically informative at the 10% level."
+            if max(effects) - min(effects) < 1e-9
+            else f"Point estimates range from {min(effects):.3f} to {max(effects):.3f}, and {significant}/{len(runs)} specifications are statistically informative at the 10% level."
+        ),
+        (
+            f"In the leading specification ({leading.name}, {lead_model}), the reported estimate is "
+            f"{lead_main['coefficient']:.3f} with standard error {lead_main['std_error']:.3f}."
+        ),
         consistency,
     ]
     return "\n".join(paragraph) + "\n"
@@ -1979,13 +2064,15 @@ def main() -> None:
         return
 
     if args.command == "sweep":
-        runs = load_sweep_config(args.config)
+        payload = load_sweep_config(args.config)
+        runs = materialize_sweep_runs(payload)
+        table_options = payload.get("table", {})
         payload = {
             "num_specs": len(runs),
             "models": [run.name for run in runs],
         }
         if args.export_models_table:
-            export_models_table(runs, args.export_models_table)
+            export_models_table(runs, args.export_models_table, table_options=table_options)
             payload["export_models_table"] = args.export_models_table
         if args.export_results_paragraph:
             export_results_paragraph(runs, args.export_results_paragraph)

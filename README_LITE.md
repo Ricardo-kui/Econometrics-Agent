@@ -357,6 +357,40 @@ python lite_econometrics_agent.py sweep \
   --export-results-paragraph sweep_results.md
 ```
 
+`sweep.json` 还支持 `expand` 自动展开稳健性矩阵，以及 `table` 自定义导出格式。例如：
+
+```json
+{
+  "base_spec": {
+    "data": "ols_demo.csv",
+    "outcome": "y",
+    "treatment": "x",
+    "controls": ["c"]
+  },
+  "expand": {
+    "cov_type": [
+      {"value": "auto", "label": "robust"},
+      {"value": "hac", "label": "hac2"}
+    ],
+    "hac_maxlags": [1, 2]
+  },
+  "table": {
+    "drop_terms": ["const"],
+    "row_order": ["x", "c"],
+    "group_headers": [
+      {
+        "label": "OLS Variants",
+        "models": ["cov_type=robust__hac_maxlags=1", "cov_type=hac2__hac_maxlags=2"]
+      }
+    ],
+    "notes": [
+      "Standard errors in parentheses.",
+      "Stars denote 10%, 5%, and 1% significance."
+    ]
+  }
+}
+```
+
 ## 可解释性原则
 
 - 自动选模只用明确规则，不做黑箱决策
@@ -371,6 +405,7 @@ python lite_econometrics_agent.py sweep \
 - 可以通过 `label-map` 把变量名映射成更可读的表格标签
 - RDD / fuzzy RDD 会输出带宽或多项式阶数的敏感性对比
 - 可以通过 `sweep` 子命令把多个规格合并成并列表和结果段落
+- `sweep` 支持 `expand` 自动展开规格矩阵，支持 `group_headers / notes / row_order / drop_terms`
 - 所有结果都以结构化 JSON + 系数表打印
 
 ## 当前边界
