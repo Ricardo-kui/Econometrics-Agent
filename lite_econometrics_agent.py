@@ -70,6 +70,12 @@ class FitBundle:
 
 
 @dataclass
+class SweepRun:
+    name: str
+    summary: dict[str, Any]
+
+
+@dataclass
 class ScalarResult:
     params: pd.Series
     std_errors: pd.Series
@@ -1001,7 +1007,7 @@ class LiteEconometricsAgent:
         self.spec = spec
         self.reflection_log: list[str] = []
 
-    def run(self) -> dict[str, Any]:
+    def run(self, emit: bool = True, allow_exports: bool = True) -> dict[str, Any]:
         raw = self._strip_column_names(self._load_data(self.spec.data))
         model, reasons = RulePlanner.choose_model(self.spec, raw)
         plan = RulePlanner.build_plan(model)
@@ -1010,11 +1016,13 @@ class LiteEconometricsAgent:
         bundle = self._fit_model(prepared, model)
         diagnostics = self._evaluate_result(prepared, model, bundle)
         summary = self._build_summary(prepared, model, reasons, plan, bundle, diagnostics)
-        self._maybe_export_balance(bundle)
-        self._maybe_export_terms(summary)
-        self._maybe_export_narrative(summary)
-        self._emit(summary)
-        if self.spec.save_summary:
+        if allow_exports:
+            self._maybe_export_balance(bundle)
+            self._maybe_export_terms(summary)
+            self._maybe_export_narrative(summary)
+        if emit:
+            self._emit(summary)
+        if self.spec.save_summary and allow_exports:
             Path(self.spec.save_summary).write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
         return summary
 
@@ -1563,6 +1571,153 @@ def show_knowledge(model: str) -> None:
     print(json.dumps(payload, indent=2, ensure_ascii=False))
 
 
+def build_spec_from_dict(data: dict[str, Any]) -> AnalysisSpec:
+    return AnalysisSpec(
+        data=data["data"],
+        outcome=data["outcome"],
+        treatment=data["treatment"],
+        controls=data.get("controls", []),
+        query=data.get("query", ""),
+        instrument=data.get("instrument"),
+        weights=data.get("weights"),
+        cluster=data.get("cluster"),
+        entity_id=data.get("entity_id"),
+        time_id=data.get("time_id"),
+        treat_group=data.get("treat_group"),
+        post=data.get("post"),
+        running_variable=data.get("running_variable"),
+        cutoff=data.get("cutoff"),
+        bandwidth=data.get("bandwidth"),
+        kernel=data.get("kernel", "triangle"),
+        rdd_mode=data.get("rdd_mode", "auto"),
+        poly_order=data.get("poly_order", 1),
+        estimand=data.get("estimand", "ATE"),
+        matched_num=data.get("matched_num", 1),
+        cov_type=data.get("cov_type", "auto"),
+        hac_maxlags=data.get("hac_maxlags", 1),
+        export_balance=data.get("export_balance"),
+        export_terms=data.get("export_terms"),
+        export_narrative=data.get("export_narrative"),
+        label_map=data.get("label_map"),
+        model=data.get("model", "auto"),
+        lead_window=data.get("lead_window", 4),
+        lag_window=data.get("lag_window", 3),
+        save_summary=data.get("save_summary"),
+    )
+
+
+def load_sweep_config(config_path: str) -> list[SweepRun]:
+    payload = json.loads(Path(config_path).read_text(encoding="utf-8"))
+    if isinstance(payload, dict) and "specs" in payload:
+        base = payload.get("base_spec", {})
+        specs = payload["specs"]
+    elif isinstance(payload, list):
+        base = {}
+        specs = payload
+    else:
+        raise ValueError("Sweep config must be a list of specs or a dict with `specs`.")
+
+    runs: list[SweepRun] = []
+    for idx, spec_cfg in enumerate(specs, start=1):
+        merged = {**base, **spec_cfg}
+        name = merged.pop("name", f"model_{idx}")
+        summary = LiteEconometricsAgent(build_spec_from_dict(merged)).run(emit=False, allow_exports=False)
+        runs.append(SweepRun(name=name, summary=summary))
+    return runs
+
+
+def build_models_table(runs: list[SweepRun]) -> pd.DataFrame:
+    row_order: list[str] = []
+    row_labels: dict[str, str] = {}
+    for run in runs:
+        for record in run.summary["terms_table"]:
+            label = record["label"]
+            if label not in row_labels:
+                row_labels[label] = label
+                row_order.extend([label, f"{label}__se"])
+
+    row_order.extend(["N", "R2"])
+    table = pd.DataFrame({"row_label": [label.replace("__se", " (SE)") for label in row_order]})
+
+    for run in runs:
+        column = []
+        lookup = {record["label"]: record for record in run.summary["terms_table"]}
+        for row in row_order:
+            if row == "N":
+                column.append(str(run.summary["data_rows_used"]))
+            elif row == "R2":
+                r2 = run.summary["main_result"]["r_squared"]
+                column.append("" if r2 is None else f"{r2:.3f}")
+            elif row.endswith("__se"):
+                key = row[:-4]
+                column.append(lookup.get(key, {}).get("se_display", ""))
+            else:
+                column.append(lookup.get(row, {}).get("coef_display", ""))
+        table[run.name] = column
+    return table
+
+
+def dataframe_to_latex(table: pd.DataFrame) -> str:
+    def fmt(value: Any) -> str:
+        if pd.isna(value):
+            return ""
+        return str(value).replace("_", "\\_")
+
+    cols = list(table.columns)
+    header = " & ".join(cols) + r" \\"
+    rows = [" & ".join(fmt(row[col]) for col in cols) + r" \\" for _, row in table.iterrows()]
+    alignment = "l" * len(cols)
+    return "\n".join(
+        [
+            rf"\begin{{tabular}}{{{alignment}}}",
+            r"\hline",
+            header,
+            r"\hline",
+            "\n".join(rows),
+            r"\hline",
+            r"\end{tabular}",
+        ]
+    )
+
+
+def export_models_table(runs: list[SweepRun], output_path: str) -> None:
+    table = build_models_table(runs)
+    path = Path(output_path)
+    if path.suffix.lower() in {".tex", ".latex"}:
+        path.write_text(dataframe_to_latex(table), encoding="utf-8")
+    else:
+        table.to_csv(path, index=False)
+
+
+def build_results_paragraph(runs: list[SweepRun]) -> str:
+    if not runs:
+        return ""
+    direction_words = []
+    signs = []
+    for run in runs:
+        coef = run.summary["main_result"]["coefficient"]
+        pvalue = run.summary["main_result"]["pvalue"]
+        direction = "positive" if coef > 0 else "negative" if coef < 0 else "near zero"
+        significance = "statistically informative" if pvalue <= 0.1 else "imprecise"
+        signs.append(direction)
+        direction_words.append(
+            f"{run.name}: {run.summary['selected_model']} estimate = {coef:.3f} ({significance}, {direction})"
+        )
+    consistency = "The sign is directionally consistent across specifications." if len(set(signs)) == 1 else "The sign is not fully consistent across specifications."
+    paragraph = [
+        "# Results Paragraph",
+        "",
+        "Across the reported specifications, the main effect can be summarized as follows.",
+        "; ".join(direction_words) + ".",
+        consistency,
+    ]
+    return "\n".join(paragraph) + "\n"
+
+
+def export_results_paragraph(runs: list[SweepRun], output_path: str) -> None:
+    Path(output_path).write_text(build_results_paragraph(runs), encoding="utf-8")
+
+
 def make_demo_data(output_dir: Path) -> dict[str, Path]:
     rng = np.random.default_rng(42)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1803,6 +1958,11 @@ def build_parser() -> argparse.ArgumentParser:
     knowledge_parser = subparsers.add_parser("knowledge", help="Print the absorbed econometric knowledge cards.")
     knowledge_parser.add_argument("--model", choices=["all", "ols", "fe", "iv", "did", "event-study", "psm", "ipw", "aipw", "ipwra", "rdd", "fuzzy-rdd"], default="all")
 
+    sweep_parser = subparsers.add_parser("sweep", help="Run multiple specifications from a JSON config and export combined outputs.")
+    sweep_parser.add_argument("--config", required=True)
+    sweep_parser.add_argument("--export-models-table")
+    sweep_parser.add_argument("--export-results-paragraph")
+
     return parser
 
 
@@ -1816,6 +1976,21 @@ def main() -> None:
 
     if args.command == "knowledge":
         show_knowledge(args.model)
+        return
+
+    if args.command == "sweep":
+        runs = load_sweep_config(args.config)
+        payload = {
+            "num_specs": len(runs),
+            "models": [run.name for run in runs],
+        }
+        if args.export_models_table:
+            export_models_table(runs, args.export_models_table)
+            payload["export_models_table"] = args.export_models_table
+        if args.export_results_paragraph:
+            export_results_paragraph(runs, args.export_results_paragraph)
+            payload["export_results_paragraph"] = args.export_results_paragraph
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
         return
 
     spec = AnalysisSpec(

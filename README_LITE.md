@@ -329,6 +329,34 @@ python lite_econometrics_agent.py run \
 python lite_econometrics_agent.py demo
 ```
 
+### 21. 跑一个 specification sweep
+
+先准备一个 JSON：
+
+```json
+{
+  "base_spec": {
+    "data": "ols_demo.csv",
+    "outcome": "y",
+    "treatment": "x",
+    "controls": ["c"]
+  },
+  "specs": [
+    {"name": "baseline", "query": "baseline ols", "model": "ols"},
+    {"name": "hac2", "query": "ols with HAC", "model": "ols", "cov_type": "hac", "hac_maxlags": 2}
+  ]
+}
+```
+
+然后：
+
+```bash
+python lite_econometrics_agent.py sweep \
+  --config sweep.json \
+  --export-models-table sweep_table.csv \
+  --export-results-paragraph sweep_results.md
+```
+
 ## 可解释性原则
 
 - 自动选模只用明确规则，不做黑箱决策
@@ -342,6 +370,7 @@ python lite_econometrics_agent.py demo
 - 可以导出论文式 narrative，总结方法选择、识别逻辑、主结果和风险
 - 可以通过 `label-map` 把变量名映射成更可读的表格标签
 - RDD / fuzzy RDD 会输出带宽或多项式阶数的敏感性对比
+- 可以通过 `sweep` 子命令把多个规格合并成并列表和结果段落
 - 所有结果都以结构化 JSON + 系数表打印
 
 ## 当前边界
