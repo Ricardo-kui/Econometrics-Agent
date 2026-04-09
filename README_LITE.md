@@ -7,7 +7,7 @@
 ## 原项目中保留了什么
 
 - 任务分解：把问题拆成数据校验、模型选择、估计、反思四步
-- 模型选择：根据用户请求和数据结构，在 `OLS / FE / IV / DID / Event Study / PSM / IPW / AIPW / IPWRA / Sharp RDD / Fuzzy RDD` 间做规则驱动选择
+- 模型选择：根据用户请求和数据结构，在 `OLS / FE / IV / DID / Event Study / PSM / IPW / AIPW / IPWRA / Sharp RDD / Fuzzy RDD` 间做规则驱动选择；`RDD` 还支持 `local-linear / global-poly` 两种形态
 - 工具思想：不让 LLM 自由发挥“发明方法”，而是显式调用本地计量函数
 - reflection：对报错、缺失、常数列、弱工具变量和估计精度做基础反思
 - 方法知识卡：把原项目里分散在 tool docstring 和 prompt guidance 里的识别逻辑，压成结构化知识库
@@ -173,7 +173,8 @@ python lite_econometrics_agent.py run \
   --outcome y \
   --treatment treat \
   --controls x1 x2 \
-  --model aipw
+  --model aipw \
+  --estimand ATT
 ```
 
 ### 11. 跑一个 IPWRA
@@ -185,7 +186,8 @@ python lite_econometrics_agent.py run \
   --outcome y \
   --treatment treat \
   --controls x1 x2 \
-  --model ipwra
+  --model ipwra \
+  --estimand ATT
 ```
 
 ### 12. 跑一个 Fuzzy RDD
@@ -203,7 +205,23 @@ python lite_econometrics_agent.py run \
   --model fuzzy-rdd
 ```
 
-### 13. 使用 HAC 标准误
+### 13. 跑一个 Global Polynomial RDD
+
+```bash
+python lite_econometrics_agent.py run \
+  --data cutoff_sample.csv \
+  --query "run a global polynomial sharp RDD around the score cutoff" \
+  --outcome y \
+  --treatment treat \
+  --controls x1 \
+  --running-variable score \
+  --cutoff 0 \
+  --rdd-mode global-poly \
+  --poly-order 3 \
+  --model rdd
+```
+
+### 14. 使用 HAC 标准误
 
 ```bash
 python lite_econometrics_agent.py run \
@@ -216,7 +234,7 @@ python lite_econometrics_agent.py run \
   --hac-maxlags 2
 ```
 
-### 14. 使用双向聚类
+### 15. 使用双向聚类
 
 ```bash
 python lite_econometrics_agent.py run \
@@ -230,7 +248,7 @@ python lite_econometrics_agent.py run \
   --cov-type cluster-both
 ```
 
-### 15. 导出 balance table
+### 16. 导出 balance table
 
 ```bash
 python lite_econometrics_agent.py run \
@@ -243,7 +261,31 @@ python lite_econometrics_agent.py run \
   --export-balance balance_table.csv
 ```
 
-### 16. 一键演示 OLS / FE / DID / Event Study / PSM / IPW / AIPW / IPWRA / Sharp RDD / Fuzzy RDD / IV
+### 17. 导出系数表
+
+```bash
+python lite_econometrics_agent.py run \
+  --data my_data.csv \
+  --query "baseline ols" \
+  --outcome y \
+  --treatment treat \
+  --controls x1 x2 \
+  --export-terms regression_terms.csv
+```
+
+或者导出成 LaTeX：
+
+```bash
+python lite_econometrics_agent.py run \
+  --data my_data.csv \
+  --query "baseline ols" \
+  --outcome y \
+  --treatment treat \
+  --controls x1 x2 \
+  --export-terms regression_terms.tex
+```
+
+### 18. 一键演示 OLS / FE / DID / Event Study / PSM / IPW / AIPW / IPWRA / Sharp RDD / Fuzzy RDD / IV
 
 ```bash
 python lite_econometrics_agent.py demo
@@ -258,6 +300,7 @@ python lite_econometrics_agent.py demo
 - 支持 `weights`、`cluster`、`cov-type`、`hac-maxlags` 作为显式输入，而不是藏在内部假设里
 - 对 `PSM / IPW / AIPW` 会输出 balance 改善前后的 standardized mean difference 摘要
 - 可以把 propensity-score 方法的 balance 诊断导出为 CSV 表
+- 可以把系数表导出为 `csv` 或 `tex`
 - 所有结果都以结构化 JSON + 系数表打印
 
 ## 当前边界
@@ -266,9 +309,9 @@ python lite_econometrics_agent.py demo
 - FE、Staggered DID、Event Study 要求同时提供 `entity-id` 和 `time-id`
 - IV 版本当前只支持单个工具变量
 - Event Study 当前假设处理状态是单调开启的二元变量
-- 当前 RDD 层已经支持 `sharp` 和 `fuzzy` local-linear 版本，但还没有接 global polynomial 版本
+- 当前 RDD 层已经支持 `sharp/fuzzy` 的 `local-linear` 和 `global-poly` 两种模式
 - PSM / IPW 当前面向二元处理变量，且默认依赖“selection on observables”
-- AIPW 当前支持 `ATE`，还没有扩到 `ATT`
-- IPWRA 当前支持 `ATE`，还没有扩到 `ATT`
+- AIPW 当前支持 `ATE` 和 `ATT`
+- IPWRA 当前支持 `ATE` 和 `ATT`
 - `cluster-both` 目前主要面向面板型模型；`HAC` 目前优先用于非面板或 kernel-based 协方差场景
 - reflection 是规则型，不是开放式 LLM 自修复

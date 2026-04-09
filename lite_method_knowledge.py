@@ -50,13 +50,13 @@ METHOD_KNOWLEDGE = {
         "common_failure_modes": ["always-treated units", "treatment that turns on and off repeatedly", "over-interpreting noisy pre-trends"],
     },
     "rdd": {
-        "display_name": "Sharp RDD Local Linear",
+        "display_name": "Sharp RDD",
         "absorbed_from_original_tools": ["Sharp_Regression_Discontinuity_Design_regression"],
         "when_to_use": "Use when treatment assignment changes discontinuously at a known cutoff in a running variable.",
         "core_rule": "If the query mentions a cutoff / threshold / discontinuity and a running variable plus cutoff are provided, route to sharp RDD.",
         "required_inputs": ["outcome", "treatment", "running_variable", "cutoff", "optional controls"],
         "identification_logic": "Compare observations just above and below the cutoff under continuity of potential outcomes at the threshold.",
-        "diagnostics_to_check": ["support on both sides of the cutoff", "bandwidth sensitivity", "whether treatment jumps sharply at the threshold"],
+        "diagnostics_to_check": ["support on both sides of the cutoff", "bandwidth or polynomial sensitivity", "whether treatment jumps sharply at the threshold"],
         "common_failure_modes": ["cutoff outside support", "fuzzy treatment despite sharp RDD specification", "too-wide bandwidth driving global functional-form bias"],
     },
     "psm": {
@@ -100,13 +100,13 @@ METHOD_KNOWLEDGE = {
         "common_failure_modes": ["poor overlap", "joint misspecification of weighting and outcome models", "reading weighted regression adjustment as assumption-free"],
     },
     "fuzzy-rdd": {
-        "display_name": "Fuzzy RDD Local Linear",
+        "display_name": "Fuzzy RDD",
         "absorbed_from_original_tools": ["Fuzzy_Regression_Discontinuity_Design_regression"],
         "when_to_use": "Use when cutoff assignment shifts treatment probability but does not deterministically assign treatment.",
         "core_rule": "If the query explicitly mentions fuzzy RDD and running-variable / cutoff inputs are available, route here instead of sharp RDD.",
         "required_inputs": ["outcome", "treatment", "running_variable", "cutoff", "optional controls"],
         "identification_logic": "Use crossing the cutoff as an instrument for treatment within a local bandwidth around the threshold.",
-        "diagnostics_to_check": ["support near cutoff", "first-stage jump in treatment probability", "bandwidth sensitivity"],
+        "diagnostics_to_check": ["support near cutoff", "first-stage jump in treatment probability", "bandwidth or polynomial sensitivity"],
         "common_failure_modes": ["weak first stage at the cutoff", "using fuzzy RDD when treatment is actually sharp", "interpreting global patterns as local treatment effects"],
     },
 }

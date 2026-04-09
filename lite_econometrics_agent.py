@@ -45,11 +45,14 @@ class AnalysisSpec:
     cutoff: float | None = None
     bandwidth: float | None = None
     kernel: str = "triangle"
+    rdd_mode: str = "auto"
+    poly_order: int = 1
     estimand: str = "ATE"
     matched_num: int = 1
     cov_type: str = "auto"
     hac_maxlags: int = 1
     export_balance: str | None = None
+    export_terms: str | None = None
     model: str = "auto"
     lead_window: int = 4
     lag_window: int = 3
@@ -104,6 +107,7 @@ class RulePlanner:
     EVENT_STUDY_KEYWORDS = {"event study", "dynamic effect", "dynamic treatment", "lead", "lag", "pretrend", "pre-trend"}
     RDD_KEYWORDS = {"rdd", "regression discontinuity", "discontinuity", "cutoff", "threshold"}
     FUZZY_RDD_KEYWORDS = {"fuzzy rdd", "fuzzy regression discontinuity", "fuzzy discontinuity"}
+    GLOBAL_POLY_KEYWORDS = {"global polynomial", "polynomial rdd", "higher-order polynomial", "global poly"}
     PSM_KEYWORDS = {"psm", "matching", "matched", "propensity score"}
     IPW_KEYWORDS = {"ipw", "inverse probability weighting", "propensity weighting"}
     AIPW_KEYWORDS = {"aipw", "augmented ipw", "double robust", "doubly robust", "augmented inverse probability weighting"}
@@ -128,6 +132,7 @@ class RulePlanner:
         event_requested = any(keyword in query for keyword in cls.EVENT_STUDY_KEYWORDS)
         rdd_requested = any(keyword in query for keyword in cls.RDD_KEYWORDS)
         fuzzy_rdd_requested = any(keyword in query for keyword in cls.FUZZY_RDD_KEYWORDS)
+        global_poly_requested = any(keyword in query for keyword in cls.GLOBAL_POLY_KEYWORDS)
         psm_requested = any(keyword in query for keyword in cls.PSM_KEYWORDS)
         ipw_requested = any(keyword in query for keyword in cls.IPW_KEYWORDS)
         aipw_requested = any(keyword in query for keyword in cls.AIPW_KEYWORDS)
@@ -146,10 +151,14 @@ class RulePlanner:
 
         if spec.running_variable and spec.cutoff is not None and fuzzy_rdd_requested:
             reasons.append("running variable and cutoff were provided explicitly for a fuzzy RDD task")
+            if global_poly_requested:
+                reasons.append("query asks for a global polynomial discontinuity specification")
             return "fuzzy-rdd", reasons
 
         if spec.running_variable and spec.cutoff is not None:
             reasons.append("running variable and cutoff were provided explicitly")
+            if global_poly_requested:
+                reasons.append("query asks for a global polynomial discontinuity specification")
             return "rdd", reasons
 
         if fuzzy_rdd_requested and spec.running_variable:
@@ -509,8 +518,6 @@ class EconometricTools:
 
     @staticmethod
     def fit_aipw(df: pd.DataFrame, spec: AnalysisSpec) -> FitBundle:
-        if spec.estimand.upper() != "ATE":
-            raise ValueError("AIPW currently supports ATE only.")
         propensity, _ = EconometricTools._estimate_propensity(df, spec)
         estimate, details = EconometricTools._aipw_estimate(df, propensity, spec)
         std_error = EconometricTools._bootstrap_scalar_estimate(
@@ -522,25 +529,24 @@ class EconometricTools:
                 spec,
             )[0],
         )
-        result = make_scalar_result(term="ate_aipw", estimate=estimate, std_error=std_error)
+        term_name = f"{spec.estimand.lower()}_aipw"
+        result = make_scalar_result(term=term_name, estimate=estimate, std_error=std_error)
         overlap = EconometricTools._overlap_summary(df[spec.treatment], propensity)
         balance = EconometricTools._balance_diagnostics(df, spec, after_weights=details["ipw_weights"])
         return FitBundle(
             result=result,
-            main_term="ate_aipw",
+            main_term=term_name,
             model_label="aipw",
             extras={
                 "propensity_range": overlap,
                 "weight_summary": details["weight_summary"],
                 "balance_summary": balance,
-                "priority_terms": ["ate_aipw"],
+                "priority_terms": [term_name],
             },
         )
 
     @staticmethod
     def fit_ipwra(df: pd.DataFrame, spec: AnalysisSpec) -> FitBundle:
-        if spec.estimand.upper() != "ATE":
-            raise ValueError("IPWRA currently supports ATE only.")
         propensity, _ = EconometricTools._estimate_propensity(df, spec)
         estimate, details = EconometricTools._ipwra_estimate(df, propensity, spec)
         std_error = EconometricTools._bootstrap_scalar_estimate(
@@ -552,18 +558,19 @@ class EconometricTools:
                 spec,
             )[0],
         )
-        result = make_scalar_result(term="ate_ipwra", estimate=estimate, std_error=std_error)
+        term_name = f"{spec.estimand.lower()}_ipwra"
+        result = make_scalar_result(term=term_name, estimate=estimate, std_error=std_error)
         overlap = EconometricTools._overlap_summary(df[spec.treatment], propensity)
         balance = EconometricTools._balance_diagnostics(df, spec, after_weights=details["ipw_weights"])
         return FitBundle(
             result=result,
-            main_term="ate_ipwra",
+            main_term=term_name,
             model_label="ipwra",
             extras={
                 "propensity_range": overlap,
                 "weight_summary": details["weight_summary"],
                 "balance_summary": balance,
-                "priority_terms": ["ate_ipwra"],
+                "priority_terms": [term_name],
             },
         )
 
@@ -575,14 +582,8 @@ class EconometricTools:
             raise ValueError("Sharp RDD requires a binary treatment indicator.")
 
         selected, bandwidth = EconometricTools._select_rdd_sample(df, spec)
-
         centered = (selected[spec.running_variable] - spec.cutoff).rename("running_centered")
-        interaction = (centered * selected[spec.treatment]).rename("running_interaction")
-        base_weights = EconometricTools._kernel_weights(centered, bandwidth, spec.kernel)
-        if spec.weights:
-            base_weights = base_weights * selected[spec.weights].astype(float)
-
-        X = pd.concat([selected[[spec.treatment] + spec.controls], centered, interaction], axis=1)
+        X, base_weights = EconometricTools._build_sharp_rdd_design(selected, centered, bandwidth, spec)
         X = sm.add_constant(X, has_constant="add")
         y = selected[spec.outcome]
         cluster_groups = selected[spec.cluster] if spec.cluster else None
@@ -595,6 +596,8 @@ class EconometricTools:
                 "bandwidth_used": bandwidth,
                 "n_left": int((selected[spec.running_variable] < spec.cutoff).sum()),
                 "n_right": int((selected[spec.running_variable] >= spec.cutoff).sum()),
+                "rdd_mode": spec.rdd_mode,
+                "poly_order": spec.poly_order,
                 "priority_terms": [spec.treatment],
             },
         )
@@ -608,15 +611,8 @@ class EconometricTools:
         running = selected[spec.running_variable].astype(float)
         assignment = (running >= spec.cutoff).astype(float).rename("cutoff_assignment")
         centered = (running - spec.cutoff).rename("running_centered")
-        interaction = (centered * assignment).rename("running_interaction")
-        weights = EconometricTools._kernel_weights(centered, bandwidth, spec.kernel)
-        if spec.weights:
-            weights = weights * selected[spec.weights].astype(float)
-
         y = selected[spec.outcome]
-        exog = pd.DataFrame({"const": 1.0, "running_centered": centered, "running_interaction": interaction}, index=selected.index)
-        for col in spec.controls:
-            exog[col] = selected[col]
+        exog, weights = EconometricTools._build_fuzzy_rdd_design(selected, centered, assignment, bandwidth, spec)
         endog = selected[spec.treatment].astype(float)
         instruments = pd.DataFrame({"cutoff_assignment": assignment}, index=selected.index)
         fit_kwargs = EconometricTools._iv_fit_kwargs(spec, selected)
@@ -629,6 +625,8 @@ class EconometricTools:
                 "bandwidth_used": bandwidth,
                 "n_left": int((selected[spec.running_variable] < spec.cutoff).sum()),
                 "n_right": int((selected[spec.running_variable] >= spec.cutoff).sum()),
+                "rdd_mode": spec.rdd_mode,
+                "poly_order": spec.poly_order,
                 "priority_terms": [spec.treatment],
             },
         )
@@ -738,9 +736,19 @@ class EconometricTools:
         mu1 = pd.Series(model_treated.predict(X), index=df.index)
         mu0 = pd.Series(model_control.predict(X), index=df.index)
 
-        influence = mu1 - mu0 + treated * (outcome - mu1) / propensity - (1 - treated) * (outcome - mu0) / (1 - propensity)
-        estimate = float((sample_weights * influence).sum() / sample_weights.sum())
-        ipw_weights = sample_weights * (treated / propensity + (1 - treated) / (1 - propensity))
+        estimand = spec.estimand.upper()
+        if estimand == "ATT":
+            p_treated = float((sample_weights * treated).sum() / sample_weights.sum())
+            if p_treated <= 0:
+                raise ValueError("ATT AIPW requires treated observations.")
+            term_treated = sample_weights * treated * (outcome - mu0)
+            term_control = sample_weights * (1 - treated) * propensity / (1 - propensity) * (outcome - mu0)
+            estimate = float((term_treated.sum() - term_control.sum()) / (sample_weights * treated).sum())
+            ipw_weights = sample_weights * (treated + (1 - treated) * propensity / (1 - propensity))
+        else:
+            influence = mu1 - mu0 + treated * (outcome - mu1) / propensity - (1 - treated) * (outcome - mu0) / (1 - propensity)
+            estimate = float((sample_weights * influence).sum() / sample_weights.sum())
+            ipw_weights = sample_weights * (treated / propensity + (1 - treated) / (1 - propensity))
         details = {
             "ipw_weights": ipw_weights,
             "weight_summary": {
@@ -756,18 +764,31 @@ class EconometricTools:
         treated = df[spec.treatment].astype(float)
         outcome = df[spec.outcome].astype(float)
         sample_weights = df[spec.weights].astype(float) if spec.weights else pd.Series(1.0, index=df.index)
-        ipw_weights = sample_weights * (treated / propensity + (1 - treated) / (1 - propensity))
-        sqrt_ipw = np.sqrt(ipw_weights)
+        X = sm.add_constant(df[spec.controls], has_constant="add")
+        treated_mask = treated == 1
+        control_mask = treated == 0
+        if treated_mask.sum() == 0 or control_mask.sum() == 0:
+            raise ValueError("IPWRA requires both treated and control observations.")
 
-        X = sm.add_constant(df[[spec.treatment] + spec.controls], has_constant="add")
-        result = EconometricTools._fit_statsmodels(
-            outcome,
-            X,
-            spec,
-            weights=sqrt_ipw,
-            cluster_groups=df[spec.cluster] if spec.cluster else None,
-        )
-        estimate = float(result.params[spec.treatment])
+        estimand = spec.estimand.upper()
+        if estimand == "ATT":
+            w_t = sample_weights.loc[treated_mask]
+            w_c = (sample_weights * propensity / (1 - propensity)).loc[control_mask]
+            model_treated = sm.WLS(outcome.loc[treated_mask], X.loc[treated_mask], weights=w_t).fit()
+            model_control = sm.WLS(outcome.loc[control_mask], X.loc[control_mask], weights=w_c).fit()
+            mu1 = pd.Series(model_treated.predict(X), index=df.index)
+            mu0 = pd.Series(model_control.predict(X), index=df.index)
+            estimate = float(np.average((mu1 - mu0).loc[treated_mask], weights=sample_weights.loc[treated_mask]))
+            ipw_weights = sample_weights * (treated + (1 - treated) * propensity / (1 - propensity))
+        else:
+            w_t = (sample_weights / propensity).loc[treated_mask]
+            w_c = (sample_weights / (1 - propensity)).loc[control_mask]
+            model_treated = sm.WLS(outcome.loc[treated_mask], X.loc[treated_mask], weights=w_t).fit()
+            model_control = sm.WLS(outcome.loc[control_mask], X.loc[control_mask], weights=w_c).fit()
+            mu1 = pd.Series(model_treated.predict(X), index=df.index)
+            mu0 = pd.Series(model_control.predict(X), index=df.index)
+            estimate = float(np.average(mu1 - mu0, weights=sample_weights))
+            ipw_weights = sample_weights * (treated / propensity + (1 - treated) / (1 - propensity))
         details = {
             "ipw_weights": ipw_weights,
             "weight_summary": {
@@ -782,15 +803,66 @@ class EconometricTools:
     def _select_rdd_sample(df: pd.DataFrame, spec: AnalysisSpec) -> tuple[pd.DataFrame, float]:
         selected = df.copy()
         running = selected[spec.running_variable].astype(float)
+        use_full_sample = spec.rdd_mode == "global-poly" and spec.bandwidth is None
         bandwidth = max(running.max() - spec.cutoff, spec.cutoff - running.min()) if spec.bandwidth is None else float(spec.bandwidth)
         if bandwidth <= 0:
             raise ValueError("RDD bandwidth must be positive.")
-        selected = selected[(running >= spec.cutoff - bandwidth) & (running <= spec.cutoff + bandwidth)].copy()
+        if not use_full_sample:
+            selected = selected[(running >= spec.cutoff - bandwidth) & (running <= spec.cutoff + bandwidth)].copy()
         if selected.empty:
             raise ValueError("RDD bandwidth leaves no usable observations.")
         if (selected[spec.running_variable] >= spec.cutoff).sum() == 0 or (selected[spec.running_variable] < spec.cutoff).sum() == 0:
             raise ValueError("RDD requires support on both sides of the cutoff.")
         return selected, bandwidth
+
+    @staticmethod
+    def _build_sharp_rdd_design(selected: pd.DataFrame, centered: pd.Series, bandwidth: float, spec: AnalysisSpec) -> tuple[pd.DataFrame, pd.Series | None]:
+        base = pd.DataFrame(index=selected.index)
+        base[spec.treatment] = selected[spec.treatment]
+        if spec.rdd_mode == "global-poly":
+            for order in range(1, max(spec.poly_order, 1) + 1):
+                term = centered.pow(order).rename(f"running_order_{order}")
+                interaction = (term * selected[spec.treatment]).rename(f"running_order_{order}_interaction")
+                base[term.name] = term
+                base[interaction.name] = interaction
+            weights = selected[spec.weights].astype(float) if spec.weights else None
+        else:
+            interaction = (centered * selected[spec.treatment]).rename("running_interaction")
+            base[centered.name] = centered
+            base[interaction.name] = interaction
+            weights = EconometricTools._kernel_weights(centered, bandwidth, spec.kernel)
+            if spec.weights:
+                weights = weights * selected[spec.weights].astype(float)
+        for col in spec.controls:
+            base[col] = selected[col]
+        return base, weights
+
+    @staticmethod
+    def _build_fuzzy_rdd_design(
+        selected: pd.DataFrame,
+        centered: pd.Series,
+        assignment: pd.Series,
+        bandwidth: float,
+        spec: AnalysisSpec,
+    ) -> tuple[pd.DataFrame, pd.Series | None]:
+        exog = pd.DataFrame({"const": 1.0}, index=selected.index)
+        if spec.rdd_mode == "global-poly":
+            for order in range(1, max(spec.poly_order, 1) + 1):
+                term = centered.pow(order).rename(f"running_order_{order}")
+                interaction = (term * assignment).rename(f"running_order_{order}_interaction")
+                exog[term.name] = term
+                exog[interaction.name] = interaction
+            weights = selected[spec.weights].astype(float) if spec.weights else None
+        else:
+            interaction = (centered * assignment).rename("running_interaction")
+            exog[centered.name] = centered
+            exog[interaction.name] = interaction
+            weights = EconometricTools._kernel_weights(centered, bandwidth, spec.kernel)
+            if spec.weights:
+                weights = weights * selected[spec.weights].astype(float)
+        for col in spec.controls:
+            exog[col] = selected[col]
+        return exog, weights
 
     @staticmethod
     def _balance_diagnostics(df: pd.DataFrame, spec: AnalysisSpec, after_weights: pd.Series | None = None) -> dict[str, Any]:
@@ -903,8 +975,9 @@ class LiteEconometricsAgent:
         prepared = self._prepare_data(raw, model)
         bundle = self._fit_model(prepared, model)
         diagnostics = self._evaluate_result(prepared, model, bundle)
-        self._maybe_export_balance(bundle)
         summary = self._build_summary(prepared, model, reasons, plan, bundle, diagnostics)
+        self._maybe_export_balance(bundle)
+        self._maybe_export_terms(summary)
         self._emit(summary)
         if self.spec.save_summary:
             Path(self.spec.save_summary).write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -936,6 +1009,7 @@ class LiteEconometricsAgent:
         did_like = any(keyword in query for keyword in RulePlanner.DID_KEYWORDS)
         rdd_like = any(keyword in query for keyword in RulePlanner.RDD_KEYWORDS)
         fuzzy_rdd_like = any(keyword in query for keyword in RulePlanner.FUZZY_RDD_KEYWORDS)
+        global_poly_like = any(keyword in query for keyword in RulePlanner.GLOBAL_POLY_KEYWORDS)
         if did_like and model not in {"did", "event-study"}:
             self.reflection_log.append(
                 "query mentions a DID-style design, but available variables were insufficient for DID routing; review treat_group/post or panel treatment timing"
@@ -948,6 +1022,11 @@ class LiteEconometricsAgent:
             self.reflection_log.append(
                 "query mentions fuzzy RDD, but the available discontinuity inputs did not trigger fuzzy-RDD routing"
             )
+        if global_poly_like and model in {"rdd", "fuzzy-rdd"} and self.spec.rdd_mode == "auto":
+            self.spec.rdd_mode = "global-poly"
+            if self.spec.poly_order < 2:
+                self.spec.poly_order = 2
+            self.reflection_log.append("query suggests a global-polynomial RDD specification, so rdd_mode was upgraded to global-poly")
         if model == "event-study" and RulePlanner.has_panel_structure(self.spec, df):
             self.reflection_log.append("event-study was selected because the task asks for dynamic treatment effects in panel data")
 
@@ -962,6 +1041,45 @@ class LiteEconometricsAgent:
         output_path = Path(self.spec.export_balance)
         table.to_csv(output_path, index=False)
         self.reflection_log.append(f"exported balance table to {output_path}")
+
+    def _maybe_export_terms(self, summary: dict[str, Any]) -> None:
+        if not self.spec.export_terms:
+            return
+        table = pd.DataFrame(summary["all_terms"])
+        output_path = Path(self.spec.export_terms)
+        suffix = output_path.suffix.lower()
+        if suffix in {".tex", ".latex"}:
+            output_path.write_text(self._dataframe_to_latex(table), encoding="utf-8")
+        else:
+            table.to_csv(output_path, index=False)
+        self.reflection_log.append(f"exported coefficient table to {output_path}")
+
+    @staticmethod
+    def _dataframe_to_latex(table: pd.DataFrame) -> str:
+        def fmt(value: Any) -> str:
+            if pd.isna(value):
+                return ""
+            if isinstance(value, (int, float, np.floating)):
+                return f"{float(value):.6f}"
+            text = str(value)
+            return text.replace("_", "\\_")
+
+        cols = list(table.columns)
+        header = " & ".join(cols) + r" \\"
+        rows = [" & ".join(fmt(row[col]) for col in cols) + r" \\" for _, row in table.iterrows()]
+        alignment = "l" + "r" * (len(cols) - 1)
+        body = "\n".join(rows)
+        return "\n".join(
+            [
+                rf"\begin{{tabular}}{{{alignment}}}",
+                r"\hline",
+                header,
+                r"\hline",
+                body,
+                r"\hline",
+                r"\end{tabular}",
+            ]
+        )
 
     def _prepare_data(self, df: pd.DataFrame, model: str) -> pd.DataFrame:
         frame = df.copy()
@@ -1040,8 +1158,17 @@ class LiteEconometricsAgent:
             if self.spec.running_variable is None or self.spec.cutoff is None:
                 raise ValueError("RDD requires --running-variable and --cutoff.")
             self.spec.kernel = self.spec.kernel.lower()
+            self.spec.rdd_mode = self.spec.rdd_mode.lower()
             if self.spec.kernel not in {"uniform", "triangle", "epanechnikov"}:
                 raise ValueError("RDD kernel must be one of: uniform, triangle, epanechnikov.")
+            if self.spec.rdd_mode not in {"auto", "local-linear", "global-poly"}:
+                raise ValueError("rdd-mode must be one of: auto, local-linear, global-poly.")
+            if self.spec.rdd_mode == "auto":
+                self.spec.rdd_mode = "local-linear"
+            if self.spec.poly_order < 1:
+                raise ValueError("poly-order must be at least 1.")
+            if self.spec.rdd_mode == "global-poly" and self.spec.poly_order < 2:
+                self.spec.poly_order = 2
 
         return frame
 
@@ -1160,11 +1287,15 @@ class LiteEconometricsAgent:
             diagnostics.append(
                 f"RDD support near cutoff: left={bundle.extras.get('n_left', 0)}, right={bundle.extras.get('n_right', 0)}, bandwidth={bundle.extras.get('bandwidth_used')}"
             )
+            if bundle.extras.get("rdd_mode") == "global-poly":
+                diagnostics.append(f"RDD global polynomial order: {bundle.extras.get('poly_order')}")
 
         if model == "fuzzy-rdd":
             diagnostics.append(
                 f"Fuzzy RDD support near cutoff: left={bundle.extras.get('n_left', 0)}, right={bundle.extras.get('n_right', 0)}, bandwidth={bundle.extras.get('bandwidth_used')}"
             )
+            if bundle.extras.get("rdd_mode") == "global-poly":
+                diagnostics.append(f"Fuzzy RDD global polynomial order: {bundle.extras.get('poly_order')}")
             if hasattr(result, "first_stage"):
                 try:
                     first_stage = result.first_stage.diagnostics
@@ -1222,8 +1353,11 @@ class LiteEconometricsAgent:
             "cutoff": self.spec.cutoff,
             "bandwidth": self.spec.bandwidth,
             "kernel": self.spec.kernel,
+            "rdd_mode": self.spec.rdd_mode,
+            "poly_order": self.spec.poly_order,
             "estimand": self.spec.estimand,
             "export_balance": self.spec.export_balance,
+            "export_terms": self.spec.export_terms,
             "main_term_reported": term,
             "main_result": {
                 "coefficient": round(float(result.params[term]), 6),
@@ -1413,6 +1547,7 @@ def run_demo(output_dir: str) -> None:
             outcome="y",
             treatment="treat",
             controls=["x1", "x2"],
+            estimand="ATT",
             model="auto",
         ),
         AnalysisSpec(
@@ -1421,6 +1556,7 @@ def run_demo(output_dir: str) -> None:
             outcome="y",
             treatment="treat",
             controls=["x1", "x2"],
+            estimand="ATT",
             model="ipwra",
         ),
         AnalysisSpec(
@@ -1431,6 +1567,8 @@ def run_demo(output_dir: str) -> None:
             controls=["x"],
             running_variable="score",
             cutoff=0.0,
+            rdd_mode="global-poly",
+            poly_order=3,
             model="auto",
         ),
         AnalysisSpec(
@@ -1478,11 +1616,14 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--cutoff", type=float)
     run_parser.add_argument("--bandwidth", type=float)
     run_parser.add_argument("--kernel", choices=["uniform", "triangle", "epanechnikov"], default="triangle")
+    run_parser.add_argument("--rdd-mode", choices=["auto", "local-linear", "global-poly"], default="auto")
+    run_parser.add_argument("--poly-order", type=int, default=1)
     run_parser.add_argument("--estimand", choices=["ATE", "ATT"], default="ATE")
     run_parser.add_argument("--matched-num", type=int, default=1)
     run_parser.add_argument("--cov-type", choices=["auto", "robust", "cluster", "cluster-both", "hac"], default="auto")
     run_parser.add_argument("--hac-maxlags", type=int, default=1)
     run_parser.add_argument("--export-balance")
+    run_parser.add_argument("--export-terms")
     run_parser.add_argument("--model", choices=["auto", "ols", "fe", "iv", "did", "event-study", "psm", "ipw", "aipw", "ipwra", "rdd", "fuzzy-rdd"], default="auto")
     run_parser.add_argument("--lead-window", type=int, default=4)
     run_parser.add_argument("--lag-window", type=int, default=3)
@@ -1526,11 +1667,14 @@ def main() -> None:
         cutoff=args.cutoff,
         bandwidth=args.bandwidth,
         kernel=args.kernel,
+        rdd_mode=args.rdd_mode,
+        poly_order=args.poly_order,
         estimand=args.estimand,
         matched_num=args.matched_num,
         cov_type=args.cov_type,
         hac_maxlags=args.hac_maxlags,
         export_balance=args.export_balance,
+        export_terms=args.export_terms,
         model=args.model,
         lead_window=args.lead_window,
         lag_window=args.lag_window,
