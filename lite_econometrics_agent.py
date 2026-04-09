@@ -12,6 +12,7 @@ import pandas as pd
 import statsmodels.api as sm
 from linearmodels import PanelOLS
 from linearmodels.iv import IV2SLS
+from scipy.stats import norm
 
 from lite_method_knowledge import METHOD_KNOWLEDGE
 
@@ -34,10 +35,18 @@ class AnalysisSpec:
     controls: list[str] = field(default_factory=list)
     query: str = ""
     instrument: str | None = None
+    weights: str | None = None
+    cluster: str | None = None
     entity_id: str | None = None
     time_id: str | None = None
     treat_group: str | None = None
     post: str | None = None
+    running_variable: str | None = None
+    cutoff: float | None = None
+    bandwidth: float | None = None
+    kernel: str = "triangle"
+    estimand: str = "ATE"
+    matched_num: int = 1
     model: str = "auto"
     lead_window: int = 4
     lag_window: int = 3
@@ -52,11 +61,47 @@ class FitBundle:
     extras: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class ScalarResult:
+    params: pd.Series
+    std_errors: pd.Series
+    pvalues: pd.Series
+    rsquared: float | None = None
+    rsquared_adj: float | None = None
+
+
+def make_scalar_result(term: str, estimate: float, std_error: float | None = None, extra: dict[str, float] | None = None) -> ScalarResult:
+    extra = extra or {}
+    se = np.nan if std_error is None else float(std_error)
+    if se is None or np.isnan(se) or se <= 0:
+        pvalue = np.nan
+    else:
+        z_score = float(estimate) / se
+        pvalue = float(2 * (1 - norm.cdf(abs(z_score))))
+    params = {"const": 0.0, term: float(estimate)}
+    ses = {"const": np.nan, term: se}
+    pvalues = {"const": np.nan, term: pvalue}
+    for key, value in extra.items():
+        params[key] = float(value)
+        ses[key] = np.nan
+        pvalues[key] = np.nan
+    return ScalarResult(
+        params=pd.Series(params),
+        std_errors=pd.Series(ses),
+        pvalues=pd.Series(pvalues),
+        rsquared=None,
+        rsquared_adj=None,
+    )
+
+
 class RulePlanner:
     IV_KEYWORDS = {"iv", "2sls", "instrument", "instrumental", "endogeneity", "endogenous"}
     FE_KEYWORDS = {"fe", "fixed effect", "fixed effects", "twfe", "panel", "within", "entity effect", "time effect"}
     DID_KEYWORDS = {"did", "difference in difference", "difference-in-differences", "policy shock", "treated", "staggered adoption"}
     EVENT_STUDY_KEYWORDS = {"event study", "dynamic effect", "dynamic treatment", "lead", "lag", "pretrend", "pre-trend"}
+    RDD_KEYWORDS = {"rdd", "regression discontinuity", "discontinuity", "cutoff", "threshold"}
+    PSM_KEYWORDS = {"psm", "matching", "matched", "propensity score"}
+    IPW_KEYWORDS = {"ipw", "inverse probability weighting", "propensity weighting"}
 
     @classmethod
     def has_panel_structure(cls, spec: AnalysisSpec, df: pd.DataFrame) -> bool:
@@ -75,6 +120,9 @@ class RulePlanner:
         panel = cls.has_panel_structure(spec, df)
         did_requested = any(keyword in query for keyword in cls.DID_KEYWORDS)
         event_requested = any(keyword in query for keyword in cls.EVENT_STUDY_KEYWORDS)
+        rdd_requested = any(keyword in query for keyword in cls.RDD_KEYWORDS)
+        psm_requested = any(keyword in query for keyword in cls.PSM_KEYWORDS)
+        ipw_requested = any(keyword in query for keyword in cls.IPW_KEYWORDS)
 
         if spec.model != "auto":
             return spec.model, [f"user_forced_model={spec.model}"]
@@ -86,6 +134,22 @@ class RulePlanner:
         if any(keyword in query for keyword in cls.IV_KEYWORDS):
             reasons.append("query mentions IV / endogenous treatment")
             return "iv", reasons
+
+        if spec.running_variable and spec.cutoff is not None:
+            reasons.append("running variable and cutoff were provided explicitly")
+            return "rdd", reasons
+
+        if rdd_requested and spec.running_variable:
+            reasons.append("query mentions a discontinuity design and a running variable is available")
+            return "rdd", reasons
+
+        if ipw_requested and spec.treatment in df.columns and is_binary_like(df[spec.treatment]):
+            reasons.append("query explicitly requests inverse-probability weighting")
+            return "ipw", reasons
+
+        if psm_requested and spec.treatment in df.columns and is_binary_like(df[spec.treatment]):
+            reasons.append("query explicitly requests propensity-score matching")
+            return "psm", reasons
 
         if event_requested and panel:
             reasons.append("query asks for dynamic treatment effects or pre-trends")
@@ -125,10 +189,58 @@ class RulePlanner:
 
 class EconometricTools:
     @staticmethod
+    def _user_weights(df: pd.DataFrame, spec: AnalysisSpec) -> pd.Series | None:
+        if not spec.weights:
+            return None
+        return df[spec.weights].astype(float)
+
+    @staticmethod
+    def _fit_statsmodels(
+        y: pd.Series,
+        X: pd.DataFrame,
+        spec: AnalysisSpec,
+        weights: pd.Series | None = None,
+        cluster_groups: pd.Series | None = None,
+    ):
+        model = sm.WLS(y, X, weights=weights) if weights is not None else sm.OLS(y, X)
+        if spec.cluster:
+            if cluster_groups is None:
+                raise ValueError("cluster groups must be provided when cluster covariance is requested")
+            return model.fit(cov_type="cluster", cov_kwds={"groups": cluster_groups})
+        return model.fit(cov_type="HC1")
+
+    @staticmethod
+    def _panel_fit(y: pd.Series, X: pd.DataFrame, spec: AnalysisSpec, *, entity_effects: bool, time_effects: bool):
+        weights = X[[spec.weights]] if spec.weights and spec.weights in X.columns else None
+        clean_X = X.drop(columns=[col for col in [spec.weights, spec.cluster] if col], errors="ignore")
+        model = PanelOLS(
+            y,
+            clean_X,
+            entity_effects=entity_effects,
+            time_effects=time_effects,
+            drop_absorbed=True,
+            weights=weights,
+        )
+        if spec.cluster:
+            if spec.cluster == spec.entity_id:
+                return model.fit(cov_type="clustered", cluster_entity=True)
+            if spec.cluster == spec.time_id:
+                return model.fit(cov_type="clustered", cluster_time=True)
+            cluster_frame = X[[spec.cluster]]
+            return model.fit(cov_type="clustered", clusters=cluster_frame)
+        if entity_effects and time_effects:
+            return model.fit(cov_type="clustered", cluster_entity=True, cluster_time=True)
+        if entity_effects:
+            return model.fit(cov_type="clustered", cluster_entity=True)
+        return model.fit(cov_type="robust")
+
+    @staticmethod
     def fit_ols(df: pd.DataFrame, spec: AnalysisSpec) -> FitBundle:
         X = sm.add_constant(df[[spec.treatment] + spec.controls], has_constant="add")
         y = df[spec.outcome]
-        result = sm.OLS(y, X).fit(cov_type="HC1")
+        weights = EconometricTools._user_weights(df, spec)
+        cluster_groups = df[spec.cluster] if spec.cluster else None
+        result = EconometricTools._fit_statsmodels(y, X, spec, weights=weights, cluster_groups=cluster_groups)
         return FitBundle(result=result, main_term=spec.treatment, model_label="ols")
 
     @staticmethod
@@ -136,10 +248,11 @@ class EconometricTools:
         if not spec.entity_id or not spec.time_id:
             raise ValueError("FE requires both --entity-id and --time-id.")
         panel = df.set_index([spec.entity_id, spec.time_id]).sort_index()
-        X = panel[[spec.treatment] + spec.controls]
+        extra_cols = [spec.cluster] if spec.cluster and spec.cluster not in {spec.entity_id, spec.time_id} else []
+        extra_cols += [spec.weights] if spec.weights else []
+        X = panel[[spec.treatment] + spec.controls + extra_cols]
         y = panel[spec.outcome]
-        model = PanelOLS(y, X, entity_effects=True, time_effects=True, drop_absorbed=True)
-        result = model.fit(cov_type="clustered", cluster_entity=True)
+        result = EconometricTools._panel_fit(y, X, spec, entity_effects=True, time_effects=True)
         return FitBundle(result=result, main_term=spec.treatment, model_label="fe")
 
     @staticmethod
@@ -153,7 +266,9 @@ class EconometricTools:
             exog[col] = df[col]
         endog = df[spec.treatment]
         instruments = df[[spec.instrument]]
-        result = IV2SLS(y, exog, endog, instruments).fit(cov_type="robust")
+        weights = EconometricTools._user_weights(df, spec)
+        fit_kwargs = {"cov_type": "clustered", "clusters": df[spec.cluster]} if spec.cluster else {"cov_type": "robust"}
+        result = IV2SLS(y, exog, endog, instruments, weights=weights).fit(**fit_kwargs)
         return FitBundle(result=result, main_term=spec.treatment, model_label="iv")
 
     @staticmethod
@@ -166,22 +281,27 @@ class EconometricTools:
     def _fit_static_did(df: pd.DataFrame, spec: AnalysisSpec) -> FitBundle:
         interaction = (df[spec.treat_group] * df[spec.post]).rename("did")
         if spec.entity_id and spec.time_id:
-            panel = df[[spec.outcome, spec.entity_id, spec.time_id] + spec.controls].copy()
+            keep_cols = [spec.outcome, spec.entity_id, spec.time_id] + spec.controls
+            if spec.cluster and spec.cluster not in {spec.entity_id, spec.time_id}:
+                keep_cols.append(spec.cluster)
+            if spec.weights:
+                keep_cols.append(spec.weights)
+            panel = df[keep_cols].copy()
             panel["did"] = interaction
             panel = panel.set_index([spec.entity_id, spec.time_id]).sort_index()
-            X = panel[["did"] + spec.controls]
+            extra_cols = [spec.cluster] if spec.cluster and spec.cluster not in {spec.entity_id, spec.time_id} else []
+            extra_cols += [spec.weights] if spec.weights else []
+            X = panel[["did"] + spec.controls + extra_cols]
             y = panel[spec.outcome]
-            result = PanelOLS(y, X, entity_effects=True, time_effects=True, drop_absorbed=True).fit(
-                cov_type="clustered",
-                cluster_entity=True,
-                cluster_time=True,
-            )
+            result = EconometricTools._panel_fit(y, X, spec, entity_effects=True, time_effects=True)
         else:
             X = df[[spec.treat_group, spec.post] + spec.controls].copy()
             X["did"] = interaction
             X = sm.add_constant(X[["did", spec.treat_group, spec.post] + spec.controls], has_constant="add")
             y = df[spec.outcome]
-            result = sm.OLS(y, X).fit(cov_type="HC1")
+            weights = EconometricTools._user_weights(df, spec)
+            cluster_groups = df[spec.cluster] if spec.cluster else None
+            result = EconometricTools._fit_statsmodels(y, X, spec, weights=weights, cluster_groups=cluster_groups)
         return FitBundle(
             result=result,
             main_term="did",
@@ -194,13 +314,11 @@ class EconometricTools:
         if not spec.entity_id or not spec.time_id:
             raise ValueError("Staggered DID requires both --entity-id and --time-id.")
         panel = df.set_index([spec.entity_id, spec.time_id]).sort_index()
-        X = panel[[spec.treatment] + spec.controls]
+        extra_cols = [spec.cluster] if spec.cluster and spec.cluster not in {spec.entity_id, spec.time_id} else []
+        extra_cols += [spec.weights] if spec.weights else []
+        X = panel[[spec.treatment] + spec.controls + extra_cols]
         y = panel[spec.outcome]
-        result = PanelOLS(y, X, entity_effects=True, time_effects=True, drop_absorbed=True).fit(
-            cov_type="clustered",
-            cluster_entity=True,
-            cluster_time=True,
-        )
+        result = EconometricTools._panel_fit(y, X, spec, entity_effects=True, time_effects=True)
         return FitBundle(
             result=result,
             main_term=spec.treatment,
@@ -218,6 +336,10 @@ class EconometricTools:
             raise ValueError("Event study requires a binary treatment indicator that switches on after adoption.")
 
         columns = [spec.outcome, spec.treatment, spec.entity_id, spec.time_id] + spec.controls
+        if spec.cluster and spec.cluster not in {spec.entity_id, spec.time_id}:
+            columns.append(spec.cluster)
+        if spec.weights:
+            columns.append(spec.weights)
         working = df[columns].copy().sort_values([spec.entity_id, spec.time_id])
 
         unique_times = working[[spec.time_id]].drop_duplicates().sort_values(spec.time_id)[spec.time_id].tolist()
@@ -259,13 +381,11 @@ class EconometricTools:
                 working.at[idx, selected_term] = 1.0
 
         panel = working.set_index([spec.entity_id, spec.time_id]).sort_index()
-        X = panel[event_terms + spec.controls]
+        extra_cols = [spec.cluster] if spec.cluster and spec.cluster not in {spec.entity_id, spec.time_id} else []
+        extra_cols += [spec.weights] if spec.weights else []
+        X = panel[event_terms + spec.controls + extra_cols]
         y = panel[spec.outcome]
-        result = PanelOLS(y, X, entity_effects=True, time_effects=True, drop_absorbed=True).fit(
-            cov_type="clustered",
-            cluster_entity=True,
-            cluster_time=True,
-        )
+        result = EconometricTools._panel_fit(y, X, spec, entity_effects=True, time_effects=True)
         return FitBundle(
             result=result,
             main_term="event_0",
@@ -278,6 +398,198 @@ class EconometricTools:
                 "dropped_always_treated_entities": always_treated_entities,
             },
         )
+
+    @staticmethod
+    def fit_psm(df: pd.DataFrame, spec: AnalysisSpec) -> FitBundle:
+        propensity, _ = EconometricTools._estimate_propensity(df, spec)
+        estimate = EconometricTools._matching_estimate(df, propensity, spec)
+        term_name = f"{spec.estimand.lower()}_psm"
+        std_error = EconometricTools._bootstrap_scalar_estimate(
+            df,
+            spec,
+            lambda boot_df: EconometricTools._matching_estimate(
+                boot_df,
+                EconometricTools._estimate_propensity(boot_df, spec)[0],
+                spec,
+            ),
+        )
+        result = make_scalar_result(term=term_name, estimate=estimate, std_error=std_error)
+        overlap = EconometricTools._overlap_summary(df[spec.treatment], propensity)
+        return FitBundle(
+            result=result,
+            main_term=term_name,
+            model_label="psm",
+            extras={"propensity_range": overlap, "priority_terms": [term_name]},
+        )
+
+    @staticmethod
+    def fit_ipw(df: pd.DataFrame, spec: AnalysisSpec) -> FitBundle:
+        propensity, _ = EconometricTools._estimate_propensity(df, spec)
+        estimate, weight_summary = EconometricTools._ipw_estimate(df, propensity, spec)
+        term_name = f"{spec.estimand.lower()}_ipw"
+        std_error = EconometricTools._bootstrap_scalar_estimate(
+            df,
+            spec,
+            lambda boot_df: EconometricTools._ipw_estimate(
+                boot_df,
+                EconometricTools._estimate_propensity(boot_df, spec)[0],
+                spec,
+            )[0],
+        )
+        result = make_scalar_result(term=term_name, estimate=estimate, std_error=std_error)
+        overlap = EconometricTools._overlap_summary(df[spec.treatment], propensity)
+        return FitBundle(
+            result=result,
+            main_term=term_name,
+            model_label="ipw",
+            extras={"propensity_range": overlap, "weight_summary": weight_summary, "priority_terms": [term_name]},
+        )
+
+    @staticmethod
+    def fit_rdd(df: pd.DataFrame, spec: AnalysisSpec) -> FitBundle:
+        if spec.running_variable is None or spec.cutoff is None:
+            raise ValueError("RDD requires --running-variable and --cutoff.")
+        if not is_binary_like(df[spec.treatment]):
+            raise ValueError("Sharp RDD requires a binary treatment indicator.")
+
+        selected = df.copy()
+        running = selected[spec.running_variable].astype(float)
+        if spec.bandwidth is None:
+            bandwidth = max(running.max() - spec.cutoff, spec.cutoff - running.min())
+        else:
+            bandwidth = float(spec.bandwidth)
+        if bandwidth <= 0:
+            raise ValueError("RDD bandwidth must be positive.")
+        selected = selected[(running >= spec.cutoff - bandwidth) & (running <= spec.cutoff + bandwidth)].copy()
+        if selected.empty:
+            raise ValueError("RDD bandwidth leaves no usable observations.")
+        if (selected[spec.running_variable] >= spec.cutoff).sum() == 0 or (selected[spec.running_variable] < spec.cutoff).sum() == 0:
+            raise ValueError("RDD requires support on both sides of the cutoff.")
+
+        centered = (selected[spec.running_variable] - spec.cutoff).rename("running_centered")
+        interaction = (centered * selected[spec.treatment]).rename("running_interaction")
+        base_weights = EconometricTools._kernel_weights(centered, bandwidth, spec.kernel)
+        if spec.weights:
+            base_weights = base_weights * selected[spec.weights].astype(float)
+
+        X = pd.concat([selected[[spec.treatment] + spec.controls], centered, interaction], axis=1)
+        X = sm.add_constant(X, has_constant="add")
+        y = selected[spec.outcome]
+        cluster_groups = selected[spec.cluster] if spec.cluster else None
+        result = EconometricTools._fit_statsmodels(y, X, spec, weights=base_weights, cluster_groups=cluster_groups)
+        return FitBundle(
+            result=result,
+            main_term=spec.treatment,
+            model_label="rdd",
+            extras={
+                "bandwidth_used": bandwidth,
+                "n_left": int((selected[spec.running_variable] < spec.cutoff).sum()),
+                "n_right": int((selected[spec.running_variable] >= spec.cutoff).sum()),
+                "priority_terms": [spec.treatment],
+            },
+        )
+
+    @staticmethod
+    def _estimate_propensity(df: pd.DataFrame, spec: AnalysisSpec) -> tuple[pd.Series, Any]:
+        if not spec.controls:
+            raise ValueError("PSM/IPW require at least one control variable to estimate a propensity score.")
+        if not is_binary_like(df[spec.treatment]):
+            raise ValueError("PSM/IPW require a binary treatment variable.")
+        X = sm.add_constant(df[spec.controls], has_constant="add")
+        model = sm.Logit(df[spec.treatment].astype(float), X).fit(disp=False)
+        propensity = pd.Series(model.predict(X), index=df.index, name="propensity_score").clip(1e-3, 1 - 1e-3)
+        return propensity, model
+
+    @staticmethod
+    def _matching_estimate(df: pd.DataFrame, propensity: pd.Series, spec: AnalysisSpec) -> float:
+        treated = df[spec.treatment].astype(int)
+        outcome = df[spec.outcome].astype(float)
+        k = max(int(spec.matched_num), 1)
+        treat_index = treated[treated == 1].index
+        control_index = treated[treated == 0].index
+        if len(treat_index) == 0 or len(control_index) == 0:
+            raise ValueError("PSM requires both treated and control observations.")
+
+        def matched_mean(source_idx, target_idx):
+            estimates = []
+            for idx in source_idx:
+                distances = (propensity.loc[target_idx] - propensity.loc[idx]).abs().sort_values()
+                neighbors = distances.head(k).index
+                estimates.append(float(outcome.loc[neighbors].mean()))
+            return pd.Series(estimates, index=source_idx)
+
+        if spec.estimand.upper() == "ATT":
+            matched_control = matched_mean(treat_index, control_index)
+            return float(outcome.loc[treat_index].mean() - matched_control.mean())
+
+        matched_control = matched_mean(treat_index, control_index)
+        matched_treated = matched_mean(control_index, treat_index)
+        return float(
+            pd.concat([outcome.loc[treat_index], matched_treated]).mean()
+            - pd.concat([outcome.loc[control_index], matched_control]).mean()
+        )
+
+    @staticmethod
+    def _ipw_estimate(df: pd.DataFrame, propensity: pd.Series, spec: AnalysisSpec) -> tuple[float, dict[str, float]]:
+        treated = df[spec.treatment].astype(float)
+        outcome = df[spec.outcome].astype(float)
+        sample_weights = df[spec.weights].astype(float) if spec.weights else pd.Series(1.0, index=df.index)
+
+        if spec.estimand.upper() == "ATT":
+            w_t = sample_weights * treated
+            w_c = sample_weights * (1 - treated) * propensity / (1 - propensity)
+            estimate = float((w_t * outcome).sum() / w_t.sum() - (w_c * outcome).sum() / w_c.sum())
+            final_weights = w_t + w_c
+        else:
+            w_t = sample_weights * treated / propensity
+            w_c = sample_weights * (1 - treated) / (1 - propensity)
+            estimate = float((w_t * outcome).sum() / w_t.sum() - (w_c * outcome).sum() / w_c.sum())
+            final_weights = w_t + w_c
+
+        summary = {
+            "weight_min": float(final_weights.min()),
+            "weight_p95": float(final_weights.quantile(0.95)),
+            "weight_max": float(final_weights.max()),
+        }
+        return estimate, summary
+
+    @staticmethod
+    def _bootstrap_scalar_estimate(df: pd.DataFrame, spec: AnalysisSpec, estimator, reps: int = 30) -> float:
+        estimates = []
+        n = len(df)
+        if n < 20:
+            return np.nan
+        for seed in range(reps):
+            boot_df = df.sample(n=n, replace=True, random_state=seed).reset_index(drop=True)
+            try:
+                estimates.append(float(estimator(boot_df)))
+            except Exception:
+                continue
+        if len(estimates) < 5:
+            return np.nan
+        return float(np.std(estimates, ddof=1))
+
+    @staticmethod
+    def _overlap_summary(treatment: pd.Series, propensity: pd.Series) -> dict[str, float]:
+        treated_scores = propensity.loc[treatment.astype(int) == 1]
+        control_scores = propensity.loc[treatment.astype(int) == 0]
+        return {
+            "treated_min": float(treated_scores.min()),
+            "treated_max": float(treated_scores.max()),
+            "control_min": float(control_scores.min()),
+            "control_max": float(control_scores.max()),
+        }
+
+    @staticmethod
+    def _kernel_weights(centered_running: pd.Series, bandwidth: float, kernel: str) -> pd.Series:
+        scaled = (centered_running / bandwidth).abs()
+        if kernel == "uniform":
+            weights = pd.Series(1.0, index=centered_running.index)
+        elif kernel == "triangle":
+            weights = 1 - scaled
+        else:
+            weights = 0.75 * (1 - scaled.pow(2))
+        return weights.clip(lower=0)
 
 
 class LiteEconometricsAgent:
@@ -323,9 +635,14 @@ class LiteEconometricsAgent:
     def _capture_routing_reflection(self, model: str, df: pd.DataFrame) -> None:
         query = (self.spec.query or "").lower()
         did_like = any(keyword in query for keyword in RulePlanner.DID_KEYWORDS)
+        rdd_like = any(keyword in query for keyword in RulePlanner.RDD_KEYWORDS)
         if did_like and model not in {"did", "event-study"}:
             self.reflection_log.append(
                 "query mentions a DID-style design, but available variables were insufficient for DID routing; review treat_group/post or panel treatment timing"
+            )
+        if rdd_like and model != "rdd":
+            self.reflection_log.append(
+                "query mentions a discontinuity design, but running-variable / cutoff inputs were insufficient for RDD routing"
             )
         if model == "event-study" and RulePlanner.has_panel_structure(self.spec, df):
             self.reflection_log.append("event-study was selected because the task asks for dynamic treatment effects in panel data")
@@ -334,7 +651,7 @@ class LiteEconometricsAgent:
         frame = df.copy()
 
         resolved = {}
-        for field_name in ["outcome", "treatment", "instrument", "entity_id", "time_id", "treat_group", "post"]:
+        for field_name in ["outcome", "treatment", "instrument", "weights", "cluster", "entity_id", "time_id", "treat_group", "post", "running_variable"]:
             value = getattr(self.spec, field_name)
             if value:
                 resolved[field_name] = self._resolve_column(frame, value)
@@ -344,13 +661,16 @@ class LiteEconometricsAgent:
         self.spec.treatment = resolved["treatment"]
         self.spec.controls = resolved_controls
         self.spec.instrument = resolved.get("instrument")
+        self.spec.weights = resolved.get("weights")
+        self.spec.cluster = resolved.get("cluster")
         self.spec.entity_id = resolved.get("entity_id")
         self.spec.time_id = resolved.get("time_id")
         self.spec.treat_group = resolved.get("treat_group")
         self.spec.post = resolved.get("post")
+        self.spec.running_variable = resolved.get("running_variable")
 
         numeric_cols = [self.spec.outcome, self.spec.treatment] + self.spec.controls
-        for optional_col in [self.spec.instrument, self.spec.treat_group, self.spec.post]:
+        for optional_col in [self.spec.instrument, self.spec.treat_group, self.spec.post, self.spec.weights, self.spec.running_variable]:
             if optional_col:
                 numeric_cols.append(optional_col)
         for col in numeric_cols:
@@ -361,7 +681,7 @@ class LiteEconometricsAgent:
                 self.reflection_log.append(f"coerced {col} to numeric and introduced {after_na - before_na} NaNs")
 
         required = [self.spec.outcome, self.spec.treatment] + self.spec.controls
-        for optional_col in [self.spec.instrument, self.spec.treat_group, self.spec.post, self.spec.entity_id, self.spec.time_id]:
+        for optional_col in [self.spec.instrument, self.spec.treat_group, self.spec.post, self.spec.weights, self.spec.running_variable, self.spec.entity_id, self.spec.time_id]:
             if optional_col:
                 required.append(optional_col)
 
@@ -382,6 +702,9 @@ class LiteEconometricsAgent:
         if model == "iv" and self.spec.instrument and frame[self.spec.instrument].nunique(dropna=True) <= 1:
             raise ValueError(f"Instrument {self.spec.instrument} has no variation after cleaning.")
 
+        if self.spec.weights and (frame[self.spec.weights] <= 0).any():
+            raise ValueError("Weights must be strictly positive.")
+
         if model in {"did", "event-study"}:
             if self.spec.treat_group and self.spec.post:
                 if not is_binary_like(frame[self.spec.treat_group]):
@@ -394,6 +717,16 @@ class LiteEconometricsAgent:
         if model in {"fe", "did", "event-study"} and self.spec.entity_id and self.spec.time_id:
             frame = frame.sort_values([self.spec.entity_id, self.spec.time_id]).copy()
 
+        if model in {"psm", "ipw"} and not self.spec.controls:
+            raise ValueError("PSM/IPW require at least one control variable for the propensity model.")
+
+        if model == "rdd":
+            if self.spec.running_variable is None or self.spec.cutoff is None:
+                raise ValueError("RDD requires --running-variable and --cutoff.")
+            self.spec.kernel = self.spec.kernel.lower()
+            if self.spec.kernel not in {"uniform", "triangle", "epanechnikov"}:
+                raise ValueError("RDD kernel must be one of: uniform, triangle, epanechnikov.")
+
         return frame
 
     def _fit_model(self, df: pd.DataFrame, model: str) -> FitBundle:
@@ -403,6 +736,9 @@ class LiteEconometricsAgent:
             "iv": EconometricTools.fit_iv,
             "did": EconometricTools.fit_did,
             "event-study": EconometricTools.fit_event_study,
+            "rdd": EconometricTools.fit_rdd,
+            "psm": EconometricTools.fit_psm,
+            "ipw": EconometricTools.fit_ipw,
         }
         try:
             bundle = tools[model](df, self.spec)
@@ -479,6 +815,24 @@ class LiteEconometricsAgent:
             if post_terms:
                 diagnostics.append(f"available dynamic post-treatment coefficients: {', '.join(post_terms)}")
 
+        if model in {"psm", "ipw"}:
+            overlap = bundle.extras.get("propensity_range", {})
+            if overlap:
+                diagnostics.append(
+                    "propensity support: treated [{treated_min:.3f}, {treated_max:.3f}], control [{control_min:.3f}, {control_max:.3f}]".format(**overlap)
+                )
+            if model == "ipw":
+                weight_summary = bundle.extras.get("weight_summary", {})
+                if weight_summary:
+                    diagnostics.append(
+                        "IPW weight summary: min={weight_min:.3f}, p95={weight_p95:.3f}, max={weight_max:.3f}".format(**weight_summary)
+                    )
+
+        if model == "rdd":
+            diagnostics.append(
+                f"RDD support near cutoff: left={bundle.extras.get('n_left', 0)}, right={bundle.extras.get('n_right', 0)}, bandwidth={bundle.extras.get('bandwidth_used')}"
+            )
+
         return diagnostics
 
     def _build_summary(
@@ -513,10 +867,17 @@ class LiteEconometricsAgent:
             "treatment": self.spec.treatment,
             "controls": self.spec.controls,
             "instrument": self.spec.instrument,
+            "weights": self.spec.weights,
+            "cluster": self.spec.cluster,
             "entity_id": self.spec.entity_id,
             "time_id": self.spec.time_id,
             "treat_group": self.spec.treat_group,
             "post": self.spec.post,
+            "running_variable": self.spec.running_variable,
+            "cutoff": self.spec.cutoff,
+            "bandwidth": self.spec.bandwidth,
+            "kernel": self.spec.kernel,
+            "estimand": self.spec.estimand,
             "main_term_reported": term,
             "main_result": {
                 "coefficient": round(float(result.params[term]), 6),
@@ -609,6 +970,23 @@ def make_demo_data(output_dir: Path) -> dict[str, Path]:
     event_path = output_dir / "event_study_demo.csv"
     event_df.to_csv(event_path, index=False)
 
+    x1 = rng.normal(size=n)
+    x2 = rng.normal(size=n)
+    latent = 0.9 * x1 - 0.6 * x2 + rng.normal(scale=0.8, size=n)
+    prob = 1 / (1 + np.exp(-latent))
+    treat_ps = (rng.random(size=n) < prob).astype(int)
+    y_ps = 1.6 * treat_ps + 0.7 * x1 - 0.4 * x2 + rng.normal(scale=1.0, size=n)
+    ps_df = pd.DataFrame({"y": y_ps, "treat": treat_ps, "x1": x1, "x2": x2})
+    psm_path = output_dir / "psm_demo.csv"
+    ps_df.to_csv(psm_path, index=False)
+
+    running = rng.uniform(-2, 2, size=n)
+    treat_rdd = (running >= 0).astype(int)
+    y_rdd = 2.2 * treat_rdd + 0.8 * running - 0.3 * running * treat_rdd + rng.normal(scale=0.7, size=n)
+    rdd_df = pd.DataFrame({"y": y_rdd, "treat": treat_rdd, "score": running, "x": rng.normal(size=n)})
+    rdd_path = output_dir / "rdd_demo.csv"
+    rdd_df.to_csv(rdd_path, index=False)
+
     z = rng.normal(size=n)
     u = rng.normal(size=n)
     treat_iv = 0.9 * z + 0.6 * u + rng.normal(scale=0.5, size=n)
@@ -617,7 +995,15 @@ def make_demo_data(output_dir: Path) -> dict[str, Path]:
     iv_path = output_dir / "iv_demo.csv"
     iv_df.to_csv(iv_path, index=False)
 
-    return {"ols": ols_path, "fe": fe_path, "did": did_path, "event-study": event_path, "iv": iv_path}
+    return {
+        "ols": ols_path,
+        "fe": fe_path,
+        "did": did_path,
+        "event-study": event_path,
+        "psm": psm_path,
+        "rdd": rdd_path,
+        "iv": iv_path,
+    }
 
 
 def run_demo(output_dir: str) -> None:
@@ -657,6 +1043,32 @@ def run_demo(output_dir: str) -> None:
             model="auto",
         ),
         AnalysisSpec(
+            data=str(paths["psm"]),
+            query="estimate the treatment effect with propensity score matching",
+            outcome="y",
+            treatment="treat",
+            controls=["x1", "x2"],
+            model="auto",
+        ),
+        AnalysisSpec(
+            data=str(paths["psm"]),
+            query="estimate the treatment effect with inverse probability weighting",
+            outcome="y",
+            treatment="treat",
+            controls=["x1", "x2"],
+            model="auto",
+        ),
+        AnalysisSpec(
+            data=str(paths["rdd"]),
+            query="run a sharp RDD around the score cutoff",
+            outcome="y",
+            treatment="treat",
+            controls=["x"],
+            running_variable="score",
+            cutoff=0.0,
+            model="auto",
+        ),
+        AnalysisSpec(
             data=str(paths["iv"]),
             query="estimate the endogenous treatment effect with IV-2SLS",
             outcome="y",
@@ -681,20 +1093,28 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--treatment", required=True)
     run_parser.add_argument("--controls", nargs="*", default=[])
     run_parser.add_argument("--instrument")
+    run_parser.add_argument("--weights")
+    run_parser.add_argument("--cluster")
     run_parser.add_argument("--entity-id")
     run_parser.add_argument("--time-id")
     run_parser.add_argument("--treat-group")
     run_parser.add_argument("--post")
-    run_parser.add_argument("--model", choices=["auto", "ols", "fe", "iv", "did", "event-study"], default="auto")
+    run_parser.add_argument("--running-variable")
+    run_parser.add_argument("--cutoff", type=float)
+    run_parser.add_argument("--bandwidth", type=float)
+    run_parser.add_argument("--kernel", choices=["uniform", "triangle", "epanechnikov"], default="triangle")
+    run_parser.add_argument("--estimand", choices=["ATE", "ATT"], default="ATE")
+    run_parser.add_argument("--matched-num", type=int, default=1)
+    run_parser.add_argument("--model", choices=["auto", "ols", "fe", "iv", "did", "event-study", "psm", "ipw", "rdd"], default="auto")
     run_parser.add_argument("--lead-window", type=int, default=4)
     run_parser.add_argument("--lag-window", type=int, default=3)
     run_parser.add_argument("--save-summary")
 
-    demo_parser = subparsers.add_parser("demo", help="Generate demo data and run OLS/FE/DID/Event-Study/IV examples.")
+    demo_parser = subparsers.add_parser("demo", help="Generate demo data and run OLS/FE/DID/Event-Study/PSM/IPW/RDD/IV examples.")
     demo_parser.add_argument("--output-dir", default="lite_demo_output")
 
     knowledge_parser = subparsers.add_parser("knowledge", help="Print the absorbed econometric knowledge cards.")
-    knowledge_parser.add_argument("--model", choices=["all", "ols", "fe", "iv", "did", "event-study"], default="all")
+    knowledge_parser.add_argument("--model", choices=["all", "ols", "fe", "iv", "did", "event-study", "psm", "ipw", "rdd"], default="all")
 
     return parser
 
@@ -718,10 +1138,18 @@ def main() -> None:
         treatment=args.treatment,
         controls=args.controls,
         instrument=args.instrument,
+        weights=args.weights,
+        cluster=args.cluster,
         entity_id=args.entity_id,
         time_id=args.time_id,
         treat_group=args.treat_group,
         post=args.post,
+        running_variable=args.running_variable,
+        cutoff=args.cutoff,
+        bandwidth=args.bandwidth,
+        kernel=args.kernel,
+        estimand=args.estimand,
+        matched_num=args.matched_num,
         model=args.model,
         lead_window=args.lead_window,
         lag_window=args.lag_window,
