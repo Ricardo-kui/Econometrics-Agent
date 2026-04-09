@@ -89,6 +89,16 @@ METHOD_KNOWLEDGE = {
         "diagnostics_to_check": ["common support", "extreme weights", "balance after weighting", "dependence on outcome-model functional form"],
         "common_failure_modes": ["poor overlap", "joint misspecification of propensity and outcome models", "treating doubly robust as assumption-free"],
     },
+    "ipwra": {
+        "display_name": "IPW Regression Adjustment",
+        "absorbed_from_original_tools": ["propensity_score_double_robust_estimator_IPW_regression_adjustment"],
+        "when_to_use": "Use when treatment is binary and the user wants a doubly robust weighted regression-adjustment estimator rather than AIPW's augmentation formula.",
+        "core_rule": "If the query asks for IPWRA or doubly robust regression adjustment with binary treatment, route here.",
+        "required_inputs": ["outcome", "binary treatment", "covariates for propensity and outcome models"],
+        "identification_logic": "Estimate treatment propensity, construct inverse-probability weights, and run a weighted regression adjustment model for the outcome.",
+        "diagnostics_to_check": ["common support", "extreme weights", "balance after weighting", "sensitivity to regression specification"],
+        "common_failure_modes": ["poor overlap", "joint misspecification of weighting and outcome models", "reading weighted regression adjustment as assumption-free"],
+    },
     "fuzzy-rdd": {
         "display_name": "Fuzzy RDD Local Linear",
         "absorbed_from_original_tools": ["Fuzzy_Regression_Discontinuity_Design_regression"],

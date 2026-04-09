@@ -47,6 +47,9 @@ class AnalysisSpec:
     kernel: str = "triangle"
     estimand: str = "ATE"
     matched_num: int = 1
+    cov_type: str = "auto"
+    hac_maxlags: int = 1
+    export_balance: str | None = None
     model: str = "auto"
     lead_window: int = 4
     lag_window: int = 3
@@ -104,6 +107,7 @@ class RulePlanner:
     PSM_KEYWORDS = {"psm", "matching", "matched", "propensity score"}
     IPW_KEYWORDS = {"ipw", "inverse probability weighting", "propensity weighting"}
     AIPW_KEYWORDS = {"aipw", "augmented ipw", "double robust", "doubly robust", "augmented inverse probability weighting"}
+    IPWRA_KEYWORDS = {"ipwra", "ipw regression adjustment", "weighted regression adjustment", "doubly robust regression adjustment"}
 
     @classmethod
     def has_panel_structure(cls, spec: AnalysisSpec, df: pd.DataFrame) -> bool:
@@ -127,6 +131,7 @@ class RulePlanner:
         psm_requested = any(keyword in query for keyword in cls.PSM_KEYWORDS)
         ipw_requested = any(keyword in query for keyword in cls.IPW_KEYWORDS)
         aipw_requested = any(keyword in query for keyword in cls.AIPW_KEYWORDS)
+        ipwra_requested = any(keyword in query for keyword in cls.IPWRA_KEYWORDS)
 
         if spec.model != "auto":
             return spec.model, [f"user_forced_model={spec.model}"]
@@ -158,6 +163,10 @@ class RulePlanner:
         if aipw_requested and spec.treatment in df.columns and is_binary_like(df[spec.treatment]):
             reasons.append("query explicitly requests a doubly robust AIPW estimator")
             return "aipw", reasons
+
+        if ipwra_requested and spec.treatment in df.columns and is_binary_like(df[spec.treatment]):
+            reasons.append("query explicitly requests IPW regression adjustment")
+            return "ipwra", reasons
 
         if ipw_requested and spec.treatment in df.columns and is_binary_like(df[spec.treatment]):
             reasons.append("query explicitly requests inverse-probability weighting")
@@ -211,6 +220,21 @@ class EconometricTools:
         return df[spec.weights].astype(float)
 
     @staticmethod
+    def _iv_fit_kwargs(spec: AnalysisSpec, df: pd.DataFrame) -> dict[str, Any]:
+        cov_type = spec.cov_type.lower()
+        if cov_type == "hac":
+            return {"cov_type": "kernel", "kernel": "bartlett", "bandwidth": spec.hac_maxlags}
+        if cov_type == "cluster" or (cov_type == "auto" and spec.cluster):
+            return {"cov_type": "clustered", "clusters": df[spec.cluster]}
+        if cov_type == "cluster":
+            raise ValueError("IV clustered covariance requires --cluster.")
+        if cov_type == "cluster-both":
+            raise ValueError("two-way cluster is not implemented for IV in this lightweight agent.")
+        if cov_type == "robust":
+            return {"cov_type": "robust"}
+        return {"cov_type": "robust"}
+
+    @staticmethod
     def _fit_statsmodels(
         y: pd.Series,
         X: pd.DataFrame,
@@ -219,7 +243,12 @@ class EconometricTools:
         cluster_groups: pd.Series | None = None,
     ):
         model = sm.WLS(y, X, weights=weights) if weights is not None else sm.OLS(y, X)
-        if spec.cluster:
+        cov_type = spec.cov_type.lower()
+        if cov_type == "hac":
+            return model.fit(cov_type="HAC", cov_kwds={"maxlags": spec.hac_maxlags})
+        if cov_type == "cluster-both":
+            raise ValueError("cluster-both is only supported for panel-style models with entity and time dimensions.")
+        if cov_type == "cluster" or (cov_type == "auto" and spec.cluster):
             if cluster_groups is None:
                 raise ValueError("cluster groups must be provided when cluster covariance is requested")
             return model.fit(cov_type="cluster", cov_kwds={"groups": cluster_groups})
@@ -237,13 +266,28 @@ class EconometricTools:
             drop_absorbed=True,
             weights=weights,
         )
-        if spec.cluster:
+        cov_type = spec.cov_type.lower()
+        if cov_type == "hac":
+            return model.fit(cov_type="kernel", kernel="bartlett", bandwidth=spec.hac_maxlags)
+        if cov_type == "cluster-both":
+            return model.fit(cov_type="clustered", cluster_entity=True, cluster_time=True)
+        if cov_type == "cluster" or (cov_type == "auto" and spec.cluster):
             if spec.cluster == spec.entity_id:
                 return model.fit(cov_type="clustered", cluster_entity=True)
             if spec.cluster == spec.time_id:
                 return model.fit(cov_type="clustered", cluster_time=True)
+            if spec.cluster is None:
+                if entity_effects and time_effects:
+                    return model.fit(cov_type="clustered", cluster_entity=True, cluster_time=True)
+                if entity_effects:
+                    return model.fit(cov_type="clustered", cluster_entity=True)
+                if time_effects:
+                    return model.fit(cov_type="clustered", cluster_time=True)
+                raise ValueError("cluster covariance for panel models requires --cluster or a panel effect structure.")
             cluster_frame = X[[spec.cluster]]
             return model.fit(cov_type="clustered", clusters=cluster_frame)
+        if cov_type == "robust":
+            return model.fit(cov_type="robust")
         if entity_effects and time_effects:
             return model.fit(cov_type="clustered", cluster_entity=True, cluster_time=True)
         if entity_effects:
@@ -283,7 +327,7 @@ class EconometricTools:
         endog = df[spec.treatment]
         instruments = df[[spec.instrument]]
         weights = EconometricTools._user_weights(df, spec)
-        fit_kwargs = {"cov_type": "clustered", "clusters": df[spec.cluster]} if spec.cluster else {"cov_type": "robust"}
+        fit_kwargs = EconometricTools._iv_fit_kwargs(spec, df)
         result = IV2SLS(y, exog, endog, instruments, weights=weights).fit(**fit_kwargs)
         return FitBundle(result=result, main_term=spec.treatment, model_label="iv")
 
@@ -494,6 +538,36 @@ class EconometricTools:
         )
 
     @staticmethod
+    def fit_ipwra(df: pd.DataFrame, spec: AnalysisSpec) -> FitBundle:
+        if spec.estimand.upper() != "ATE":
+            raise ValueError("IPWRA currently supports ATE only.")
+        propensity, _ = EconometricTools._estimate_propensity(df, spec)
+        estimate, details = EconometricTools._ipwra_estimate(df, propensity, spec)
+        std_error = EconometricTools._bootstrap_scalar_estimate(
+            df,
+            spec,
+            lambda boot_df: EconometricTools._ipwra_estimate(
+                boot_df,
+                EconometricTools._estimate_propensity(boot_df, spec)[0],
+                spec,
+            )[0],
+        )
+        result = make_scalar_result(term="ate_ipwra", estimate=estimate, std_error=std_error)
+        overlap = EconometricTools._overlap_summary(df[spec.treatment], propensity)
+        balance = EconometricTools._balance_diagnostics(df, spec, after_weights=details["ipw_weights"])
+        return FitBundle(
+            result=result,
+            main_term="ate_ipwra",
+            model_label="ipwra",
+            extras={
+                "propensity_range": overlap,
+                "weight_summary": details["weight_summary"],
+                "balance_summary": balance,
+                "priority_terms": ["ate_ipwra"],
+            },
+        )
+
+    @staticmethod
     def fit_rdd(df: pd.DataFrame, spec: AnalysisSpec) -> FitBundle:
         if spec.running_variable is None or spec.cutoff is None:
             raise ValueError("RDD requires --running-variable and --cutoff.")
@@ -545,7 +619,7 @@ class EconometricTools:
             exog[col] = selected[col]
         endog = selected[spec.treatment].astype(float)
         instruments = pd.DataFrame({"cutoff_assignment": assignment}, index=selected.index)
-        fit_kwargs = {"cov_type": "clustered", "clusters": selected[spec.cluster]} if spec.cluster else {"cov_type": "robust"}
+        fit_kwargs = EconometricTools._iv_fit_kwargs(spec, selected)
         result = IV2SLS(y, exog, endog, instruments, weights=weights).fit(**fit_kwargs)
         return FitBundle(
             result=result,
@@ -678,6 +752,33 @@ class EconometricTools:
         return estimate, details
 
     @staticmethod
+    def _ipwra_estimate(df: pd.DataFrame, propensity: pd.Series, spec: AnalysisSpec) -> tuple[float, dict[str, Any]]:
+        treated = df[spec.treatment].astype(float)
+        outcome = df[spec.outcome].astype(float)
+        sample_weights = df[spec.weights].astype(float) if spec.weights else pd.Series(1.0, index=df.index)
+        ipw_weights = sample_weights * (treated / propensity + (1 - treated) / (1 - propensity))
+        sqrt_ipw = np.sqrt(ipw_weights)
+
+        X = sm.add_constant(df[[spec.treatment] + spec.controls], has_constant="add")
+        result = EconometricTools._fit_statsmodels(
+            outcome,
+            X,
+            spec,
+            weights=sqrt_ipw,
+            cluster_groups=df[spec.cluster] if spec.cluster else None,
+        )
+        estimate = float(result.params[spec.treatment])
+        details = {
+            "ipw_weights": ipw_weights,
+            "weight_summary": {
+                "weight_min": float(ipw_weights.min()),
+                "weight_p95": float(ipw_weights.quantile(0.95)),
+                "weight_max": float(ipw_weights.max()),
+            },
+        }
+        return estimate, details
+
+    @staticmethod
     def _select_rdd_sample(df: pd.DataFrame, spec: AnalysisSpec) -> tuple[pd.DataFrame, float]:
         selected = df.copy()
         running = selected[spec.running_variable].astype(float)
@@ -696,10 +797,11 @@ class EconometricTools:
         treated = df[spec.treatment].astype(int)
         before: dict[str, float] = {}
         after: dict[str, float] = {}
+        rows: list[dict[str, float | str]] = []
         control_mask = treated == 0
         treat_mask = treated == 1
         if not spec.controls:
-            return {"before": before, "after": after, "max_abs_before": np.nan, "max_abs_after": np.nan}
+            return {"before": before, "after": after, "max_abs_before": np.nan, "max_abs_after": np.nan, "table": pd.DataFrame()}
 
         for col in spec.controls:
             x = df[col].astype(float)
@@ -707,6 +809,12 @@ class EconometricTools:
             mean_c = x.loc[control_mask].mean()
             pooled_sd = np.sqrt((x.loc[treat_mask].var(ddof=1) + x.loc[control_mask].var(ddof=1)) / 2)
             before[col] = 0.0 if pooled_sd == 0 or np.isnan(pooled_sd) else float((mean_t - mean_c) / pooled_sd)
+            row = {
+                "covariate": col,
+                "treated_mean_before": float(mean_t),
+                "control_mean_before": float(mean_c),
+                "smd_before": float(before[col]),
+            }
             if after_weights is not None:
                 wt = after_weights.loc[treat_mask]
                 wc = after_weights.loc[control_mask]
@@ -716,6 +824,22 @@ class EconometricTools:
                 var_c_w = np.average((x.loc[control_mask] - mean_c_w) ** 2, weights=wc)
                 pooled_sd_w = np.sqrt((var_t_w + var_c_w) / 2)
                 after[col] = 0.0 if pooled_sd_w == 0 or np.isnan(pooled_sd_w) else float((mean_t_w - mean_c_w) / pooled_sd_w)
+                row.update(
+                    {
+                        "treated_mean_after": float(mean_t_w),
+                        "control_mean_after": float(mean_c_w),
+                        "smd_after": float(after[col]),
+                    }
+                )
+            else:
+                row.update(
+                    {
+                        "treated_mean_after": np.nan,
+                        "control_mean_after": np.nan,
+                        "smd_after": np.nan,
+                    }
+                )
+            rows.append(row)
 
         max_before = max(abs(v) for v in before.values()) if before else np.nan
         max_after = max(abs(v) for v in after.values()) if after else np.nan
@@ -724,6 +848,7 @@ class EconometricTools:
             "after": after,
             "max_abs_before": max_before,
             "max_abs_after": max_after,
+            "table": pd.DataFrame(rows),
         }
 
     @staticmethod
@@ -778,6 +903,7 @@ class LiteEconometricsAgent:
         prepared = self._prepare_data(raw, model)
         bundle = self._fit_model(prepared, model)
         diagnostics = self._evaluate_result(prepared, model, bundle)
+        self._maybe_export_balance(bundle)
         summary = self._build_summary(prepared, model, reasons, plan, bundle, diagnostics)
         self._emit(summary)
         if self.spec.save_summary:
@@ -824,6 +950,18 @@ class LiteEconometricsAgent:
             )
         if model == "event-study" and RulePlanner.has_panel_structure(self.spec, df):
             self.reflection_log.append("event-study was selected because the task asks for dynamic treatment effects in panel data")
+
+    def _maybe_export_balance(self, bundle: FitBundle) -> None:
+        if not self.spec.export_balance:
+            return
+        balance = bundle.extras.get("balance_summary", {})
+        table = balance.get("table")
+        if table is None:
+            self.reflection_log.append("requested balance-table export, but this method does not produce a balance table")
+            return
+        output_path = Path(self.spec.export_balance)
+        table.to_csv(output_path, index=False)
+        self.reflection_log.append(f"exported balance table to {output_path}")
 
     def _prepare_data(self, df: pd.DataFrame, model: str) -> pd.DataFrame:
         frame = df.copy()
@@ -919,6 +1057,7 @@ class LiteEconometricsAgent:
             "psm": EconometricTools.fit_psm,
             "ipw": EconometricTools.fit_ipw,
             "aipw": EconometricTools.fit_aipw,
+            "ipwra": EconometricTools.fit_ipwra,
         }
         try:
             bundle = tools[model](df, self.spec)
@@ -995,7 +1134,7 @@ class LiteEconometricsAgent:
             if post_terms:
                 diagnostics.append(f"available dynamic post-treatment coefficients: {', '.join(post_terms)}")
 
-        if model in {"psm", "ipw", "aipw"}:
+        if model in {"psm", "ipw", "aipw", "ipwra"}:
             overlap = bundle.extras.get("propensity_range", {})
             if overlap:
                 diagnostics.append(
@@ -1006,7 +1145,7 @@ class LiteEconometricsAgent:
                 diagnostics.append(
                     f"max abs standardized mean difference: before={balance.get('max_abs_before'):.3f}, after={balance.get('max_abs_after'):.3f}"
                 )
-            if model in {"ipw", "aipw"}:
+            if model in {"ipw", "aipw", "ipwra"}:
                 weight_summary = bundle.extras.get("weight_summary", {})
                 if weight_summary:
                     diagnostics.append(
@@ -1014,6 +1153,8 @@ class LiteEconometricsAgent:
                     )
             if model == "aipw":
                 diagnostics.append("AIPW is doubly robust, not assumption-free; it still relies on overlap and one of the nuisance models being correctly specified")
+            if model == "ipwra":
+                diagnostics.append("IPWRA is doubly robust, but it still depends on overlap and sensible regression specification")
 
         if model == "rdd":
             diagnostics.append(
@@ -1071,6 +1212,8 @@ class LiteEconometricsAgent:
             "instrument": self.spec.instrument,
             "weights": self.spec.weights,
             "cluster": self.spec.cluster,
+            "cov_type": self.spec.cov_type,
+            "hac_maxlags": self.spec.hac_maxlags,
             "entity_id": self.spec.entity_id,
             "time_id": self.spec.time_id,
             "treat_group": self.spec.treat_group,
@@ -1080,6 +1223,7 @@ class LiteEconometricsAgent:
             "bandwidth": self.spec.bandwidth,
             "kernel": self.spec.kernel,
             "estimand": self.spec.estimand,
+            "export_balance": self.spec.export_balance,
             "main_term_reported": term,
             "main_result": {
                 "coefficient": round(float(result.params[term]), 6),
@@ -1272,6 +1416,14 @@ def run_demo(output_dir: str) -> None:
             model="auto",
         ),
         AnalysisSpec(
+            data=str(paths["psm"]),
+            query="estimate the treatment effect with IPW regression adjustment",
+            outcome="y",
+            treatment="treat",
+            controls=["x1", "x2"],
+            model="ipwra",
+        ),
+        AnalysisSpec(
             data=str(paths["rdd"]),
             query="run a sharp RDD around the score cutoff",
             outcome="y",
@@ -1328,16 +1480,19 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--kernel", choices=["uniform", "triangle", "epanechnikov"], default="triangle")
     run_parser.add_argument("--estimand", choices=["ATE", "ATT"], default="ATE")
     run_parser.add_argument("--matched-num", type=int, default=1)
-    run_parser.add_argument("--model", choices=["auto", "ols", "fe", "iv", "did", "event-study", "psm", "ipw", "aipw", "rdd", "fuzzy-rdd"], default="auto")
+    run_parser.add_argument("--cov-type", choices=["auto", "robust", "cluster", "cluster-both", "hac"], default="auto")
+    run_parser.add_argument("--hac-maxlags", type=int, default=1)
+    run_parser.add_argument("--export-balance")
+    run_parser.add_argument("--model", choices=["auto", "ols", "fe", "iv", "did", "event-study", "psm", "ipw", "aipw", "ipwra", "rdd", "fuzzy-rdd"], default="auto")
     run_parser.add_argument("--lead-window", type=int, default=4)
     run_parser.add_argument("--lag-window", type=int, default=3)
     run_parser.add_argument("--save-summary")
 
-    demo_parser = subparsers.add_parser("demo", help="Generate demo data and run OLS/FE/DID/Event-Study/PSM/IPW/AIPW/RDD/Fuzzy-RDD/IV examples.")
+    demo_parser = subparsers.add_parser("demo", help="Generate demo data and run OLS/FE/DID/Event-Study/PSM/IPW/AIPW/IPWRA/RDD/Fuzzy-RDD/IV examples.")
     demo_parser.add_argument("--output-dir", default="lite_demo_output")
 
     knowledge_parser = subparsers.add_parser("knowledge", help="Print the absorbed econometric knowledge cards.")
-    knowledge_parser.add_argument("--model", choices=["all", "ols", "fe", "iv", "did", "event-study", "psm", "ipw", "aipw", "rdd", "fuzzy-rdd"], default="all")
+    knowledge_parser.add_argument("--model", choices=["all", "ols", "fe", "iv", "did", "event-study", "psm", "ipw", "aipw", "ipwra", "rdd", "fuzzy-rdd"], default="all")
 
     return parser
 
@@ -1373,6 +1528,9 @@ def main() -> None:
         kernel=args.kernel,
         estimand=args.estimand,
         matched_num=args.matched_num,
+        cov_type=args.cov_type,
+        hac_maxlags=args.hac_maxlags,
+        export_balance=args.export_balance,
         model=args.model,
         lead_window=args.lead_window,
         lag_window=args.lag_window,
